@@ -776,6 +776,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        from hermes_maintenance_channel import revoke_adapter_channels
+        revoke_adapter_channels(self)
         _LIVE_ADAPTERS.pop(self._token, None)
         self._running = False
         for task in self._pending_text_batch_tasks.values():
@@ -886,6 +888,32 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 return
         elif not self._is_dm_intake_allowed(sender_id):
             return
+        from hermes_maintenance_source import mint_platform_text
+        plain_items = [item for item in item_list if isinstance(item, dict)
+                       and item.get("type") == ITEM_TEXT and not item.get("ref_msg")]
+        raw_texts = []
+        for item in plain_items:
+            raw_text = (item.get("text_item") or {}).get("text")
+            if isinstance(raw_text, str) and raw_text.strip():
+                raw_texts.append(raw_text)
+        if raw_texts:
+            text = "\n".join(raw_texts)
+        receipts = []
+        if raw_texts and message_id:
+            try:
+                structure = json.dumps(item_list, ensure_ascii=False, sort_keys=True,
+                                       separators=(",", ":"), default=str)
+            except (TypeError, ValueError):
+                structure = ""
+            combined_text = "\n".join(raw_texts)
+            receipt = mint_platform_text(
+                adapter=self, authority="weixin-human", receiver=self._account_id,
+                actor=sender_id, chat_id=effective_chat_id, chat_type=chat_type,
+                event_id=message_id, raw=combined_text, extraction=combined_text, display=text,
+                event_structure=structure, message_type="text",
+                input_kind="mixed_items" if len(item_list) > 1 else "text")
+            if receipt is not None:
+                receipts.append(receipt)
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
             await self._token_store.set(self._account_id, sender_id, context_token)
@@ -903,6 +931,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             text=text, message_type=_message_type_from_media(media_types, text), source=source, raw_message=message,
             message_id=message_id or None, media_urls=media_paths, media_types=media_types, timestamp=datetime.now())
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
+        if receipts:
+            event._maintenance_sources = tuple(receipts)
+            event._maintenance_display = event.text
         if event.message_type == MessageType.TEXT:
             self._enqueue_text_event(event)
         else:
@@ -1027,6 +1058,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             raise last_error
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        if metadata and metadata.get('maintenance_single_attempt') is True:
+            return await self._send_maintenance_text(chat_id, content)
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         context_token = self._token_store.get(self._account_id, chat_id)
@@ -1057,6 +1090,36 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
+
+    async def _send_maintenance_text(self, chat_id: str, content: str) -> SendResult:
+        # iLink success acknowledges the request; client_id is locally minted
+        # correlation, never a remote message receipt or durable idempotency.
+        session = self._send_session
+        if not self._running or not session or session.closed or not self._token:
+            return SendResult(success=False, error='Not connected')
+        context_token = self._token_store.get(self._account_id, chat_id)
+        if not context_token or not content or not content.strip() or len(content) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(success=False, error='MAINTENANCE_SINGLE_CONTEXT_TEXT_REQUIRED')
+        try:
+            async with self._send_text_gate:
+                if not self._running or session is not self._send_session or session.closed:
+                    return SendResult(success=False, error='Not connected')
+                if self._rate_limit_cooldown_remaining() > 0:
+                    return SendResult(success=False, error='MAINTENANCE_RATE_LIMITED')
+                response = await _send_message(session, base_url=self._base_url, token=self._token,
+                    to=chat_id, text=content, context_token=context_token,
+                    client_id=f'hermes-weixin-{uuid.uuid4().hex}')
+                if not isinstance(response, dict):
+                    return SendResult(success=False, error='MAINTENANCE_PROTOCOL_ACK_UNAVAILABLE')
+                acknowledged = (any(type(response.get(k)) is int and response[k] == 0 for k in ('ret', 'errcode'))
+                    and all(response.get(k) is None or (type(response[k]) is int and response[k] == 0)
+                            for k in ('ret', 'errcode')))
+                return SendResult(success=acknowledged, message_id=None,
+                    raw_response={'receipt_level': 'protocol_ack' if acknowledged else 'unknown',
+                                  'ret': response.get('ret'), 'errcode': response.get('errcode')},
+                    error=None if acknowledged else 'MAINTENANCE_PROTOCOL_ACK_UNAVAILABLE')
+        except Exception as exc:
+            return SendResult(success=False, error=type(exc).__name__)
 
     async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:
         """Return a valid typing ticket, refreshing via getConfig once the 600s TTL evicts it —
