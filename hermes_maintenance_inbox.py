@@ -290,9 +290,13 @@ def _projection_body(ref, payload, code=None):
 def prepare_projection(home, source_id, row):
     """Freeze a view of the existing outbox before a single gateway send."""
     source, _ = caller_owner(home, source_id)
+    current = next((r for r in read_inbox(home, source_id) if r['ref'] == row['ref']), None)
+    # The resident host may advance receipt evidence between these reads.
+    # Revalidate the frozen content and identity, independent of that evidence.
+    frozen = ('ref', 'task_id', 'kind', 'payload', 'channel', 'session_key', 'request_source_id')
     if (source['authority'] not in ('feishu-human', 'qqbot-human', 'weixin-human')
             or source.get('control_kind') != 'maintenance_inbox_read'
-            or row not in read_inbox(home, source_id)):
+            or current is None or any(row.get(k) != current.get(k) for k in frozen)):
         raise ValueError('MAINTENANCE_PROJECTION_CALLER_REQUIRED')
     payload = row['payload']
     code = None
