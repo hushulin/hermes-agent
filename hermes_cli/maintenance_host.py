@@ -1,4 +1,4 @@
-"""CLI caller boundary for an independently owned maintenance inbox."""
+"""CLI caller boundary for the owner runtime maintenance inbox."""
 import argparse
 import json
 import shlex
@@ -7,14 +7,14 @@ from types import SimpleNamespace
 from hermes_cli.maintenance_input import commit_control
 from hermes_constants import get_hermes_home
 from hermes_maintenance_inbox import (answer_binding, display_inbox,
-                                      independent_enabled, read_inbox, read_status, format_status)
+                                      inbox_enabled, read_inbox, read_status, format_status)
 from hermes_maintenance_source import (acknowledge_control_source,
                                        committed_source_for_receipt)
 
 
 def _caller(cli):
     home = get_hermes_home()
-    if not independent_enabled(home):
+    if not inbox_enabled(home):
         raise ValueError('MAINTENANCE_INDEPENDENT_HOST_DISABLED')
     receipt = commit_control(cli, 'maintenance_inbox_read', '/maintenance inbox')
     source = committed_source_for_receipt(home, cli.session_id, receipt)
@@ -42,7 +42,7 @@ def handle_command(cli, command, *, display=None):
         source = committed_source_for_receipt(home, cli.session_id, receipt)
         if source is None:
             raise ValueError('MAINTENANCE_CANCEL_COMMIT_FAILED')
-        render('取消请求已提交，独立 host 将重验；这不表示运行中的操作已停止。')
+        render('取消请求已提交，维护运行时将重验；这不表示运行中的操作已停止。')
         return source['source_id']
     if operation in ('inbox', 'result'):
         if operation == 'result':
@@ -65,7 +65,7 @@ def handle_command(cli, command, *, display=None):
         source = committed_source_for_receipt(home, cli.session_id, receipt)
         if source is None:
             raise ValueError('MAINTENANCE_ANSWER_COMMIT_FAILED')
-        render('回答已提交，独立 host 将重验并处理。')
+        render('回答已提交，维护运行时将重验并处理。')
         return source['source_id']
     if operation == 'submit':
         text = ' '.join(args).strip()
@@ -81,7 +81,7 @@ def handle_command(cli, command, *, display=None):
 
 
 def notify_pending(cli):
-    if not independent_enabled(get_hermes_home()):
+    if not inbox_enabled(get_hermes_home()):
         return
     home, caller = _caller(cli)
     rows = [r for r in read_inbox(home, caller) if r['kind'] == 'QUESTION' or r['evidence_level'] != 'DISPLAYED']
@@ -93,7 +93,7 @@ def consume_bare_consent(cli, raw):
     """Only human terminal consent to a unique, locally displayed session prompt."""
     if raw.strip().lower() not in ('同意', '确认', '拒绝', '不同意', 'yes', 'agree', 'no', 'reject'):
         return False
-    if not independent_enabled(get_hermes_home()):
+    if not inbox_enabled(get_hermes_home()):
         return False
     try:
         handle_command(cli, shlex.join(['/maintenance', 'answer', raw]))

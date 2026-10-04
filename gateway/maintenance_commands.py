@@ -1,7 +1,7 @@
 """Maintenance controls at the authenticated gateway command boundary."""
 import shlex
 
-from hermes_maintenance_inbox import (answer_binding, independent_enabled, read_inbox,
+from hermes_maintenance_inbox import (answer_binding, inbox_enabled, read_inbox,
     read_status, format_status, prepare_projection, record_projection, begin_projection_send)
 from hermes_maintenance_source import (acknowledge_control_source, commit_platform_control_source,
     derive_platform_control_source, mint_feishu_text, revise_original_input)
@@ -14,7 +14,7 @@ async def handle_command(runner, event):
     if source.chat_type != 'dm':
         return '请在与机器人的私聊中输入 /maintenance inbox。'
     home = runner._resolve_profile_home_for_source(source)
-    if not independent_enabled(home):
+    if not inbox_enabled(home):
         return 'MAINTENANCE_INDEPENDENT_HOST_DISABLED'
     adapter = runner._intake_adapter_for(source)
     key = runner._session_key_for_source(source)
@@ -89,7 +89,7 @@ async def handle_projected_reply(runner, event):
             or not re.fullmatch(r'(?:确认|同意|拒绝|不同意) WX-[A-Z2-7]{16}|回答 WX-[A-Z2-7]{16}：[^\r\n]+', (event.text or '').strip())):
         return None
     home = runner._resolve_profile_home_for_source(source)
-    if not independent_enabled(home):
+    if not inbox_enabled(home):
         return None
     base = getattr(event, '_maintenance_source', None)
     entry = await runner.async_session_store.get_or_create_session(source)

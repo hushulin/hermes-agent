@@ -23,6 +23,17 @@ def independent_enabled(home):
         return False
 
 
+def inbox_enabled(home):
+    """Both existing host backends expose the same owner-scoped outbox."""
+    try:
+        cfg = json.loads((Path(home) / 'maintenance-runtime.json').read_text(encoding='utf-8-sig'))
+        return (cfg.get('enabled') is True
+                and cfg.get('mode') in ('isolated-test', 'production')
+                and type(cfg.get('independent_host', False)) is bool)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def caller_owner(home, source_id):
     home = Path(home).resolve()
     source = read_committed_source(home, source_id)
