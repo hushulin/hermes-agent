@@ -21,12 +21,14 @@ FEISHU_TEXT_CONTRACT = "feishu-text-v2"
 FEISHU_CONTROL_CONTRACT = "feishu-control-v1"
 FEISHU_CONTROL_KINDS = frozenset({
     "typed_clarify_response", "explicit_queue", "explicit_steer", "retry_previous_input",
+    "maintenance_inbox_read", "maintenance_cancel",
 })
 CLI_CONTROL_CONTRACT = "cli-control-v1"
 CLI_CONTROL_KINDS = frozenset({
     "busy_queue", "busy_steer", "busy_interrupt",
     "slash_queue", "slash_steer", "retry_previous_input", "queue_edit",
     "typed_clarify_response",
+    "maintenance_inbox_read", "maintenance_cancel",
 })
 # The v2 event-proof contract is platform-neutral; the historical names stay as
 # aliases so existing Feishu rows and callers remain compatible.
@@ -631,8 +633,30 @@ def _ensure_host_question_table(conn):
         message_ref TEXT,
         delivered_at REAL,
         delivery_receipt_json TEXT)""")
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(maintenance_host_questions_v1)')}
+    for name in ('reply_code', 'display_hash', 'question_kind', 'evidence_level'):
+        if name not in columns:
+            conn.execute('ALTER TABLE maintenance_host_questions_v1 ADD COLUMN ' + name + ' TEXT')
     conn.execute("""CREATE INDEX IF NOT EXISTS maintenance_host_questions_session
         ON maintenance_host_questions_v1(session_key,state)""")
+
+
+def parse_weixin_question_reply(text, code, kind):
+    """Strict intent grammar. The code selects a prompt; it never authenticates."""
+    import re
+    if not isinstance(text, str) or kind not in ('CONFIRM', 'CLARIFY'):
+        return None
+    if not isinstance(code, str) or not re.fullmatch(r'WX-[A-Z2-7]{16}', code):
+        return None
+    if kind == 'CONFIRM':
+        match = re.fullmatch(r'(确认|同意|拒绝|不同意) ' + re.escape(code), text.strip())
+        return match[1] if match else None
+    match = re.fullmatch(r'回答 ' + re.escape(code) + r'：([^\r\n]+)', text.strip())
+    return match[1].strip() if match and match[1].strip() else None
+
+
+def question_display_hash(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
 def _host_question_id(value):
@@ -641,12 +665,13 @@ def _host_question_id(value):
 
 def begin_host_question_delivery(
     profile_home, prompt_id, owner_id, session_key, question, choices,
-    control_binding, *, expires_at,
+    control_binding, *, expires_at, reply_code=None, display_hash=None, question_kind=None,
 ):
     """Persist a host-owned prompt before any channel send.
 
-    The row is not answerable until ``record_host_question_delivery`` commits a
-    receipt from the real host channel. This function is deliberately not
+    Remote-reference prompts require a host send receipt. Coded Weixin prompts
+    can be selected by an exact explicit reply; the journal still verifies the
+    committed human source before recording user acknowledgement. This function is deliberately not
     exposed to model/tool content: callers must supply a host-minted prompt and
     binding.
     """
@@ -661,6 +686,12 @@ def begin_host_question_delivery(
                                   or any(not isinstance(choice, str) or not choice.strip()
                                          or len(choice) > 256 for choice in choices))):
         raise ValueError("Invalid host question choices")
+    if reply_code is not None and (
+            question_kind not in ('CONFIRM', 'CLARIFY') or
+            parse_weixin_question_reply(('确认 ' if question_kind == 'CONFIRM' else '回答 ') + reply_code
+                + ('' if question_kind == 'CONFIRM' else '：probe'), reply_code, question_kind) is None
+            or display_hash != question_display_hash(question)):
+        raise ValueError('Invalid host display binding')
     encoded_binding = control_binding_json(control_binding)
     if encoded_binding is None:
         raise ValueError("Host question binding required")
@@ -680,6 +711,8 @@ def begin_host_question_delivery(
             expected = (owner_id, session_key, question, encoded_choices, encoded_binding)
             actual = (prior["owner_id"], prior["session_key"], prior["question"],
                       prior["choices_json"], prior["control_binding_json"])
+            if (prior["reply_code"], prior["display_hash"], prior["question_kind"]) != (reply_code, display_hash, question_kind):
+                raise ValueError("Host display conflict")
             if actual != expected:
                 db.rollback()
                 raise ValueError("Host question conflict")
@@ -694,16 +727,20 @@ def begin_host_question_delivery(
             VALUES (?,?,?,?,?,?,?,?,?)""",
             (prompt_id, owner_id, session_key, question, encoded_choices,
              encoded_binding, "PREPARED", now, float(expires_at)))
+        db.execute('UPDATE maintenance_host_questions_v1 SET reply_code=?,display_hash=?,question_kind=? WHERE prompt_id=?',
+                   (reply_code, display_hash, question_kind, prompt_id))
         db.commit()
     return prompt_id
 
 
 def record_host_question_delivery(
-    profile_home, prompt_id, *, channel, session_key, message_ref, delivered_at=None,
+    profile_home, prompt_id, *, channel, session_key, message_ref, delivered_at=None, evidence_level=None, response_source_id=None,
 ):
-    """Commit delivery only after the host channel accepted the real send."""
+    """Record a remote reference or a verified, committed explicit user acknowledgement."""
+    user_ack = evidence_level == 'USER_ACKNOWLEDGED' and channel == 'weixin' and message_ref is None
+    local_display = evidence_level == 'DISPLAYED' and channel == 'local-inbox' and message_ref is None
     if not all((_host_question_id(prompt_id), _host_question_id(channel),
-                _host_question_id(session_key), _host_question_id(message_ref))):
+                _host_question_id(session_key), user_ack or local_display or _host_question_id(message_ref))):
         raise ValueError("Invalid host delivery receipt")
     explicit_time = delivered_at is not None
     when = time.time() if delivered_at is None else delivered_at
@@ -711,6 +748,8 @@ def record_host_question_delivery(
         raise ValueError("Invalid host delivery time")
     receipt = {"channel": channel, "session_key": session_key,
                "message_ref": message_ref, "delivered_at": float(when)}
+    if user_ack:
+        receipt.update(evidence_level=evidence_level, response_source_id=response_source_id)
     encoded = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     home = Path(profile_home).resolve()
     with closing(sqlite3.connect((home / "state.db").as_uri() + "?mode=rw", uri=True, timeout=5)) as db:
@@ -722,6 +761,28 @@ def record_host_question_delivery(
         if row is None or row["session_key"] != session_key:
             db.rollback()
             raise ValueError("Host question unavailable")
+        if local_display:
+            from hermes_maintenance_inbox import _journal, verify_display_receipt
+            with closing(_journal(home)) as journal:
+                journal.row_factory = sqlite3.Row
+                delivery = journal.execute('SELECT * FROM maintenance_host_delivery WHERE ref=? AND owner_id=?',
+                                           (prompt_id, row['owner_id'])).fetchone()
+            if delivery is None or delivery['evidence_level'] != 'DISPLAYED':
+                raise ValueError('Local display unavailable')
+            receipt = json.loads(delivery['receipt_json'])
+            if (receipt['delivered_at'] != float(when) or receipt['session_key'] != session_key
+                    or not verify_display_receipt(home, row['owner_id'], json.loads(delivery['payload_json']), receipt)):
+                raise ValueError('Local display unavailable')
+            encoded = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
+        if user_ack:
+            answer = read_committed_source(profile_home, response_source_id)
+            if (answer is None or answer.get('authority') != 'weixin-human'
+                    or answer.get('audience') != 'private' or answer.get('session_key') != session_key
+                    or answer.get('control_kind') != 'typed_clarify_response'
+                    or answer.get('control_binding_json') != row['control_binding_json']
+                    or row['display_hash'] != question_display_hash(row['question'])
+                    or parse_weixin_question_reply(answer['raw_text'], row['reply_code'], row['question_kind']) is None):
+                raise ValueError('Host user acknowledgement unavailable')
         if row["state"] in ("RESOLVED", "CANCELLED"):
             db.rollback()
             raise ValueError("Host question closed")
@@ -744,6 +805,8 @@ def record_host_question_delivery(
             SET state='DELIVERED',channel=?,message_ref=?,delivered_at=?,delivery_receipt_json=?
             WHERE prompt_id=? AND state='PREPARED'""",
             (channel, message_ref, float(when), encoded, prompt_id))
+        db.execute('UPDATE maintenance_host_questions_v1 SET evidence_level=? WHERE prompt_id=?',
+                   (evidence_level or 'REMOTE_MESSAGE_ID', prompt_id))
         db.commit()
     return dict(receipt)
 
@@ -761,11 +824,12 @@ def host_question_delivery(profile_home, prompt_id):
         return None
 
 
-def host_question_delivery_for_session(profile_home, session_key, *, now=None):
+def host_question_delivery_for_session(profile_home, session_key, *, now=None, reply_text=None):
     """Return the one answerable prompt for a session and the candidate count.
 
-    Zero or multiple candidates return ``(None, count)`` so callers fail closed
-    rather than guessing which private proposal a bare reply refers to.
+    Remote-reference prompts retain the legacy single-candidate selection.
+    Coded Weixin prompts require an exact reply even after user acknowledgement.
+    This selects a binding only; it grants no identity or mutation authority.
     """
     if not _host_question_id(session_key):
         raise ValueError("Invalid host question session")
@@ -777,11 +841,19 @@ def host_question_delivery_for_session(profile_home, session_key, *, now=None):
         with closing(sqlite3.connect((home / "state.db").as_uri() + "?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
             rows = db.execute("""SELECT * FROM maintenance_host_questions_v1
-                WHERE session_key=? AND state='DELIVERED' AND expires_at>?
+                WHERE session_key=? AND state IN ('PREPARED','DELIVERED') AND expires_at>?
                 ORDER BY delivered_at,prompt_id""", (session_key, float(current))).fetchall()
     except sqlite3.OperationalError:
         return None, 0
-    candidates = [dict(row) for row in rows]
+    candidates = [dict(row) for row in rows if row['state'] == 'DELIVERED' or
+                  dict(row).get('reply_code')]
+    coded = [row for row in candidates if row.get('reply_code')]
+    if coded and reply_text is None:
+        return None, len(coded)
+    if coded and reply_text is not None:
+        matches = [row for row in coded if row['display_hash'] == question_display_hash(row['question'])
+            and parse_weixin_question_reply(reply_text, row['reply_code'], row['question_kind']) is not None]
+        return (matches[0], 1) if len(matches) == 1 else (None, 0)
     return (candidates[0] if len(candidates) == 1 else None), len(candidates)
 
 
@@ -1172,10 +1244,10 @@ def commit_local_control_source(profile_home, session_id, receipt):
         db.execute("INSERT INTO maintenance_local_controls_v1 VALUES (?,?,?,?)",
                    (source_id, receipt.control_kind, receipt.control_binding_json,
                     _local_control_digest(source_id, receipt.control_kind, receipt.control_binding_json)))
-        disposition = "CONTROL" if receipt.control_kind == "typed_clarify_response" else "UNDECIDED"
+        disposition = "CONTROL" if receipt.control_kind in ("typed_clarify_response", "maintenance_inbox_read", "maintenance_cancel") else "UNDECIDED"
         db.execute("INSERT INTO maintenance_outbox_v1(source_id,disposition,enrollment_enabled) "
                    "VALUES (?,?,?)", (source_id, disposition,
-                    int(receipt.control_kind != "typed_clarify_response" and _intake_enabled_at_commit(home))))
+                    int(disposition != "CONTROL" and _intake_enabled_at_commit(home))))
         db.commit()
     return source_id
 
@@ -1243,10 +1315,10 @@ def commit_platform_control_source(profile_home, session_id, receipt):
         signed = db.execute("SELECT * FROM maintenance_sources_v1 WHERE source_id=?", (source_id,)).fetchone()
         db.execute("UPDATE maintenance_sources_v1 SET record_digest=? WHERE source_id=?",
                    (_record_digest(signed), source_id))
-        disposition = "CONTROL" if receipt.control_kind == "typed_clarify_response" else "UNDECIDED"
+        disposition = "CONTROL" if receipt.control_kind in ("typed_clarify_response", "maintenance_inbox_read", "maintenance_cancel") else "UNDECIDED"
         db.execute("INSERT INTO maintenance_outbox_v1(source_id,disposition,enrollment_enabled) "
                    "VALUES (?,?,?)", (source_id, disposition,
-                    int(receipt.control_kind != "typed_clarify_response" and _intake_enabled_at_commit(home))))
+                    int(disposition != "CONTROL" and _intake_enabled_at_commit(home))))
         _insert_feishu_text_proof(db, source_id, receipt, session_id, 0, receipt.display)
         db.commit()
     return source_id
@@ -1750,13 +1822,13 @@ def control_sources(profile_home, limit=100):
                     "SELECT o.source_id,o.rowid FROM maintenance_outbox_v1 o "
                     "JOIN maintenance_source_events_v1 e USING(source_id) "
                     "WHERE o.state='PENDING' AND o.disposition='CONTROL' "
-                    "AND e.control_kind='typed_clarify_response'").fetchall())
+                    "AND e.control_kind IN ('typed_clarify_response','maintenance_cancel')").fetchall())
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='maintenance_local_controls_v1'").fetchone():
                 rows.extend(db.execute(
                     "SELECT o.source_id,o.rowid FROM maintenance_outbox_v1 o "
                     "JOIN maintenance_local_controls_v1 c USING(source_id) "
                     "WHERE o.state='PENDING' AND o.disposition='CONTROL' "
-                    "AND c.control_kind='typed_clarify_response'").fetchall())
+                    "AND c.control_kind IN ('typed_clarify_response','maintenance_cancel')").fetchall())
             return [row[0] for row in sorted(rows, key=lambda row: row[1])[:limit]]
     except sqlite3.OperationalError:
         return []

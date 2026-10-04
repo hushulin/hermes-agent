@@ -1292,6 +1292,8 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
         # platform="cron" (scheduler) / "subagent" (delegate_task) → providers skip writes (MemoryProvider.initialize).
         "agent_context": platform if platform in ("cron", "subagent") else "primary",
     }
+    from hermes_maintenance_channel import current_adapter_channel
+    kwargs['maintenance_channel'] = current_adapter_channel()
     if kwargs["platform"] == "cli":
         kwargs["warning_callback"] = agent._emit_warning
         kwargs["status_callback"] = agent._emit_status

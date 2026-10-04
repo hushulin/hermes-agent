@@ -132,6 +132,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     def _mark_transport_disconnected(self) -> None:
         """Mark QQ WS down without stopping the reconnect loop (base's _running
         doubles as lifecycle flag; the listener must survive transient drops)."""
+        from hermes_maintenance_channel import revoke_adapter_channels
+        revoke_adapter_channels(self)
         if self.has_fatal_error:
             return
         self._write_runtime_status_safe(
@@ -228,6 +230,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
+        from hermes_maintenance_channel import revoke_adapter_channels
+        revoke_adapter_channels(self)
         self._running = False
         self._mark_disconnected()
         await cancel_task(self._listen_task)
@@ -1420,7 +1424,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send text/markdown: format, split via truncate_message(), retry transient failures."""
-        del metadata
+        if metadata and metadata.get('maintenance_single_attempt') is True:
+            return await self._send_maintenance_text(chat_id, content)
         if not await self._ensure_connected():
             return self._NOT_CONNECTED
         if not content or not content.strip():
@@ -1434,6 +1439,30 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 return last_result
             reply_to = None  # only reply_to the first chunk
         return last_result
+
+    async def _send_maintenance_text(self, chat_id: str, content: str) -> SendResult:
+        # The maintenance journal owns recovery. Never enter chat retries,
+        # splitting, markdown fallback, or the synthetic _post_message ID.
+        if not self.is_connected or self._http_client is None:
+            return self._NOT_CONNECTED
+        if self._chat_type_map.get(chat_id) != 'c2c':
+            return SendResult(success=False, error='MAINTENANCE_PRIVATE_C2C_REQUIRED')
+        if not content or not content.strip() or len(content) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(success=False, error='MAINTENANCE_SINGLE_TEXT_REQUIRED')
+        if not self._token_fresh():
+            return SendResult(success=False, error='MAINTENANCE_FRESH_TOKEN_REQUIRED')
+        try:
+            reply_to = self._last_msg_id.get(chat_id)
+            body = {'content': content, 'msg_type': MSG_TYPE_TEXT,
+                    'msg_seq': self._next_msg_seq(reply_to or chat_id)}
+            if reply_to:
+                body['msg_id'] = reply_to
+            data = await self._api_request('POST', self._messages_path('c2c', chat_id), body)
+            remote_id = data.get('id')
+            return SendResult(success=True, message_id=remote_id if isinstance(remote_id, str) and remote_id else None,
+                              raw_response=data)
+        except Exception as exc:
+            return SendResult(success=False, error=type(exc).__name__)
 
     _PERMANENT_SEND_ERRORS = ("invalid", "forbidden", "not found")
 

@@ -3612,7 +3612,7 @@ class BasePlatformAdapter(ABC):
         """Call the handler and send its reply inline, with retry, threading and
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
-        response = await self._message_handler(event)
+        response = await self._call_message_handler(event)
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
             return
@@ -4585,7 +4585,7 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
-            response = await self._message_handler(event)
+            response = await self._call_message_handler(event)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4780,9 +4780,16 @@ class BasePlatformAdapter(ABC):
             self._session_tasks.pop(session_key, None)
             self._requeue_counts.pop(session_key, None)
 
+    async def _call_message_handler(self, event):
+        from hermes_maintenance_channel import adapter_channel_scope
+        with adapter_channel_scope(self, event, self._event_session_key(event)):
+            return await self._message_handler(event)
+
     async def cancel_background_tasks(self) -> None:
         """Cancel in-flight background tasks (shutdown/replacement); 5s bound each,
         stragglers are untracked and left to unwind."""
+        from hermes_maintenance_channel import revoke_adapter_channels
+        revoke_adapter_channels(self)
         # Re-drain (max 5 rounds): a message arriving mid-gather spawns a task clear() would
         # untrack.
         for _ in range(5):

@@ -5,10 +5,11 @@ import threading
 import time
 
 import httpx
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError
 import pytest
 
 from agent.memory_reasoning import CoreSingleAttemptTransport, PriceQuote, Route
+from agent.memory_reasoning import SubscriptionAccountContract
 
 
 class Agent:
@@ -48,9 +49,28 @@ class Agent:
 def transport(*, cancelled=lambda: False, deadline=None, price=True, provider="openai"):
     return CoreSingleAttemptTransport(
         input_bound=lambda request, route: 100,
+        approved_price_version="2026-10-test",
         price=PriceQuote("2026-10-test", provider, "gpt-5", 2, 8) if price else None,
         cancelled=cancelled, deadline_monotonic=deadline or time.monotonic() + 5,
     )
+
+
+@pytest.mark.parametrize('invalid', ['missing', 'version', 'route', 'revoked', 'quota'])
+def test_subscription_requires_explicit_current_host_approval(invalid):
+    agent = Agent('codex_responses', lambda _: pytest.fail('unauthorised send'), provider='openai-codex')
+    contract = SubscriptionAccountContract('test-account', 'openai-codex', 'gpt-5', 'codex_responses')
+    single = CoreSingleAttemptTransport(input_bound=lambda *_: 100, price=None,
+        cancelled=lambda: False, deadline_monotonic=time.monotonic() + 5,
+        accounting_mode='subscription', subscription_contract=None if invalid == 'missing' else contract,
+        approved_subscription_version='wrong' if invalid == 'version' else contract.version,
+        subscription_approval_valid=lambda: invalid != 'revoked',
+        quota_observation=lambda: {'state': 'REFUSED'} if invalid == 'quota' else {'state': 'UNKNOWN'})
+    try:
+        with pytest.raises(ValueError):
+            single.complete({'model': 'wrong' if invalid == 'route' else 'gpt-5', 'input': []}, agent)
+        assert agent.sends == 0
+    finally:
+        agent.client.close()
 
 
 def test_chat_sdk_one_http_send_effort_usage_price_and_parent_preserved():
@@ -177,3 +197,144 @@ def _capture(fn):
         return fn()
     except Exception as exc:
         return exc
+
+
+@pytest.mark.parametrize("missing", ["price", "version", "stale_version", "bound", "zero", "bool", "fraction"])
+def test_unapproved_cost_contract_never_reaches_http(missing):
+    agent = Agent("chat_completions", lambda _: pytest.fail("unapproved dispatch"))
+    single = transport()
+    if missing == "price":
+        single.price = None
+    elif missing in {"version", "stale_version"}:
+        single.approved_price_version = None if missing == "version" else "old-synthetic-version"
+    else:
+        single.input_bound = None if missing == "bound" else lambda *_: {
+            "zero": 0, "bool": True, "fraction": 1.5}[missing]
+    try:
+        with pytest.raises(ValueError):
+            single.complete({"model": "gpt-5", "messages": []}, agent)
+        assert agent.sends == agent.releases == 0
+    finally:
+        agent.client.close()
+
+
+@pytest.mark.parametrize("mode", ["chat_completions", "codex_responses"])
+def test_whole_final_body_is_bounded_before_the_sdk_send(mode):
+    captured = []
+    def http_handler(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(503, json={"error": {"message": "synthetic failure"}})
+    agent = Agent(mode, http_handler)
+    single = transport()
+    observed = []
+    def bound(body, route):
+        observed.append(json.loads(json.dumps(body)))
+        body["tools"].clear()  # The estimator cannot alter the dispatched schema.
+        return 100
+    single.input_bound = bound
+    wire = {"model": "gpt-5", "tools": [], "extra_body": {
+        "tools": [{"type": "function", "function": {"name": "synthetic"}}],
+        "synthetic_extension": {"evidence": "all input fields are bounded"}}}
+    if mode == "chat_completions":
+        wire.update(messages=[{"role": "system", "content": "host instructions"},
+                              {"role": "tool", "tool_call_id": "prior", "content": "prior evidence"}],
+                    max_completion_tokens=40)
+    else:
+        wire.update(instructions="host instructions", input=[{"role": "user", "content": "prior evidence"}],
+                    max_output_tokens=40)
+    try:
+        with pytest.raises(Exception):
+            single.complete(wire, agent)
+        assert agent.sends == 1 and len(observed) == 1
+        assert observed[0]["tools"] == captured[0]["tools"]
+        assert observed[0]["synthetic_extension"] == captured[0]["synthetic_extension"]
+        for field in ("messages",) if mode == "chat_completions" else ("instructions", "input"):
+            assert observed[0][field] == captured[0][field]
+        assert single.physical_output_cap(observed[0], Route("openai", "gpt-5", "high", mode, 40))
+    finally:
+        agent.client.close()
+
+
+@pytest.mark.parametrize("cancel", [True, False])
+@pytest.mark.parametrize("accounting_mode", ["metered", "subscription"])
+def test_consumer_codex_has_no_physical_cap_and_late_terminal_usage_survives(cancel, accounting_mode):
+    from agent.memory_reasoning.transport import CompletedUsageInterrupted
+    stopped = threading.Event()
+    class Stream:
+        def __iter__(self):
+            if cancel:
+                stopped.set()
+            yield SimpleNamespace(type="response.completed", response=SimpleNamespace(
+                usage=SimpleNamespace(input_tokens=12, output_tokens=4000), service_tier="priority"))
+        def close(self):
+            pass
+    from types import SimpleNamespace
+    observed = []
+    def create(**wire):
+        observed.append(wire)
+        return Stream()
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    agent = SimpleNamespace(provider="openai-codex", model="gpt-5", api_mode="codex_responses",
+        _is_codex_backend=lambda: True, _create_request_openai_client=lambda **kw: client,
+        _close_request_openai_client=lambda *a, **kw: None,
+        _abort_request_openai_client=lambda *a, **kw: None)
+    single = transport(provider="openai-codex", cancelled=stopped.is_set)
+    if accounting_mode == 'subscription':
+        single.accounting_mode = 'subscription'
+        single.subscription_contract = SubscriptionAccountContract('synthetic-account', 'openai-codex', 'gpt-5', 'codex_responses')
+        single.approved_subscription_version = 'subscription-token-v1'
+        single.subscription_approval_valid = lambda: True
+        single.price = None
+    else:
+        single.price = PriceQuote("2026-10-test", "openai-codex", "gpt-5", 2, 8, "priority")
+    wire = {"model": "gpt-5", "input": [], "max_output_tokens": 40, "service_tier": "priority"}
+    prepared = single.prepare_request(wire, agent)
+    assert "max_output_tokens" not in prepared
+    assert not single.physical_output_cap(prepared, Route("openai-codex", "gpt-5", "high", "codex_responses", 40))
+    if cancel:
+        with pytest.raises(CompletedUsageInterrupted) as caught:
+            single.complete(prepared, agent)
+        usage = caught.value.usage
+    else:
+        answer = single.complete(prepared, agent)
+        usage = single._measured_usage(answer, Route("openai-codex", "gpt-5", "high", "codex_responses"))
+    assert len(observed) == 1
+    assert usage == {"input_tokens": 12, "output_tokens": 4000,
+                                  "cost_usd": None if accounting_mode == 'subscription' else pytest.approx((12 * 2 + 4000 * 8) / 1_000_000)}
+
+
+@pytest.mark.parametrize("failure", ["unapproved", "overbyte", "mutation", "sdk_mutation", "metered"])
+def test_client_budget_rejects_before_http(failure):
+    contract = SubscriptionAccountContract("approval", "openai", "gpt-5", "chat_completions",
+        input_policy_version="client-budget-v1", max_wire_bytes=512, token_estimate=100,
+        request_limit=1, deadline_seconds=5)
+    single = CoreSingleAttemptTransport(input_bound=None, price=None,
+        cancelled=lambda: False, deadline_monotonic=time.monotonic()+5,
+        accounting_mode="metered" if failure == "metered" else "subscription",
+        subscription_contract=contract, approved_subscription_version=contract.version,
+        subscription_approval_valid=lambda: True,
+        approved_input_policy_version=None if failure == "unapproved" else "client-budget-v1")
+    route = Route("openai", "gpt-5", "medium")
+    agent = Agent("chat_completions", lambda _: pytest.fail("forbidden send"))
+    body = {"model": "gpt-5", "messages": [{"role": "user", "content": "synthetic"}],
+            "reasoning_effort": "medium", "extra_body": {"instructions": "fixed"}}
+    try:
+        if failure == "overbyte":
+            body["extra_body"]["instructions"] = "x"*513
+        if failure in {"mutation", "sdk_mutation"}:
+            prepared = single.prepare_request(body, agent)
+            single.client_input_budget(prepared, route)
+            if failure == "mutation":
+                body["extra_body"]["instructions"] = "changed"
+            else:
+                def mutate(request):
+                    request._content = b'{"instructions":"changed"}'
+                agent.http.event_hooks["request"].append(mutate)
+        with pytest.raises((ValueError, APIConnectionError)):
+            single.complete(body, agent)
+        assert agent.sends == 0
+        if failure != "metered":
+            with pytest.raises(ValueError):
+                single.input_token_upper_bound({}, route)
+    finally:
+        agent.client.close()

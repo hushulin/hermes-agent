@@ -108,6 +108,10 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
 class GatewayInboundMixin:
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
+    async def _handle_maintenance_command(self, event):
+        from gateway.maintenance_commands import handle_command
+        return await handle_command(self, event)
+
     async def _hm_pre_gateway_dispatch_hook(
         self, event: "MessageEvent", source: SessionSource
     ) -> Optional["MessageEvent"]:
@@ -470,11 +474,33 @@ class GatewayInboundMixin:
         """Intercept a reply to a pending clarify prompt; None when the message falls through.
         Free text answers open-ended/"Other" prompts; "2" answers a multi-choice one. Resolved/retained
         replies return "" so adapters don't double-post — the agent produces the next user-facing message."""
+        from gateway.maintenance_commands import handle_projected_reply
+        projected_reply = await handle_projected_reply(self, event)
+        if projected_reply is not None:
+            return projected_reply
         try:
             from tools import clarify_gateway as _clarify_mod
             _pending_clarify = _clarify_mod.get_pending_for_session(_quick_key, include_choice_prompts=True)
         except Exception:
             return None
+        _weixin_host = None
+        if getattr(getattr(source, 'platform', None), 'value', None) == 'weixin':
+            from hermes_maintenance_source import host_question_delivery_for_session
+            _weixin_host, _ = host_question_delivery_for_session(
+                self._resolve_profile_home_for_source(source), _quick_key, reply_text=event.text)
+            if _weixin_host is not None and _weixin_host.get('reply_code'):
+                # Re-select only maintenance host prompts; ordinary clarify stays intact.
+                if _pending_clarify is not None and _pending_clarify.control_binding is not None:
+                    _clarify_mod.clear_session(_quick_key)
+                _pending_clarify = None
+            else:
+                _weixin_host = None
+                if _pending_clarify is not None and _pending_clarify.control_binding is not None:
+                    from hermes_maintenance_source import host_question_delivery
+                    cached = host_question_delivery(self._resolve_profile_home_for_source(source),
+                                                   _pending_clarify.clarify_id)
+                    if cached and cached.get('reply_code'):
+                        return None
         if _pending_clarify is None:
             # An independently running maintenance worker cannot own an
             # in-process clarify entry. Hydrate only a host receipt that was
@@ -483,7 +509,7 @@ class GatewayInboundMixin:
             try:
                 from hermes_maintenance_source import host_question_delivery_for_session
                 _home = self._resolve_profile_home_for_source(source)
-                _host_row, _host_candidates = host_question_delivery_for_session(_home, _quick_key)
+                _host_row, _host_candidates = host_question_delivery_for_session(_home, _quick_key, reply_text=event.text)
                 if _host_candidates > 1:
                     return ""
                 if _host_row is not None:
@@ -520,6 +546,8 @@ class GatewayInboundMixin:
             return _retain("multiple host-bound clarify candidates")
         _text_outcome, _coerced_reply = _clarify_mod.prepare_text_response(
             _pending_clarify, _raw_clarify_reply)
+        if _weixin_host is not None:
+            _text_outcome, _coerced_reply = _clarify_mod.TEXT_RESOLVED, _raw_clarify_reply
         if _text_outcome == _clarify_mod.TEXT_RESOLVED and _bound_clarify:
             platform = getattr(getattr(source, "platform", None), "value", None)
             if platform not in ("feishu", "qqbot", "weixin"):
@@ -538,6 +566,9 @@ class GatewayInboundMixin:
             _control = derive_platform_control_source(
                 _base, kind="typed_clarify_response", text=_raw_clarify_reply,
                 binding=_pending_clarify.control_binding) if _base is not None else None
+            if _control is not None and getattr(event, '_maintenance_control_read', None):
+                from hermes_maintenance_source import revise_original_input
+                _control = revise_original_input(_control, _control.raw)
             _session_entry = await self.async_session_store.get_or_create_session(source)
             if (_control is None or commit_platform_control_source(
                     _home, _session_entry.session_id, _control) is None):

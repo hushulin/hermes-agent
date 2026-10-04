@@ -397,8 +397,7 @@ class CLILoopsMixin:
         if idx is None:
             _cprint(f"  {t('cli.queue.usage_edit')}")
             return
-        idx = int(idx_text)
-        raw_prompt = new_prompt.strip()
+        raw_prompt = bits[1].strip()
         new_text = self._expand_paste_references(raw_prompt)
         from hermes_cli.maintenance_input import AuthoredInput, commit_control, revise_control
 

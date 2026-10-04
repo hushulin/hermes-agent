@@ -5,12 +5,12 @@ from .runner import (
     RestrictedReasoningRunner, Route, ToolBudgetExceeded, ProposalSubmission,
 )
 from .session_reader import ScopedSessionEvidenceReader
-from .transport import CoreSingleAttemptTransport, PriceQuote
+from .transport import CoreSingleAttemptTransport, PriceQuote, SubscriptionAccountContract
 
 __all__ = [
     "BudgetLimits", "Evidence", "HostHandlers", "ReasoningResult", "ReasoningTask",
     "RestrictedReasoningRunner", "Route", "ToolBudgetExceeded",
     "ProposalSubmission",
     "ScopedSessionEvidenceReader",
-    "CoreSingleAttemptTransport", "PriceQuote",
+    "CoreSingleAttemptTransport", "PriceQuote", "SubscriptionAccountContract",
 ]

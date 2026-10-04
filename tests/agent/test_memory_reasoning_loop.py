@@ -43,7 +43,7 @@ class Ledger:
         with self.lock:
             self.values[(task, dimension)] += amount
 
-    def begin_attempt(self, task):
+    def begin_attempt(self, task, *, cost_contract=None):
         with self.lock:
             self.next_attempt += 1
             self.attempts[self.next_attempt] = (task, {})
@@ -91,7 +91,7 @@ class DurableTestLedger:
                 (task, dimension, amount),
             )
 
-    def begin_attempt(self, task):
+    def begin_attempt(self, task, *, cost_contract=None):
         with self.db:
             attempt_id = self.db.execute("INSERT INTO attempt(task) VALUES (?)", (task,)).lastrowid
             self.record(task, "model_attempts_prepared", 1)
@@ -143,6 +143,7 @@ def test_transport_completed_response_cancel_keeps_numeric_usage(monkeypatch):
     monkeypatch.setattr("agent.memory_reasoning.transport.bypass_chat_sdk_request_transform",
                         lambda wire, client: wire)
     transport = CoreSingleAttemptTransport(input_bound=lambda *args: 100,
+        approved_price_version="v1",
         price=PriceQuote("v1", "openai", "test-model", 1.0, 2.0),
         cancelled=lambda: stopped["value"], deadline_monotonic=time.monotonic() + 30)
     with pytest.raises(CompletedUsageInterrupted) as caught:

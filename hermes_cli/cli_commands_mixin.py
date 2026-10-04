@@ -615,6 +615,14 @@ _BROWSER_SUBCOMMANDS = {
 
 
 class CLICommandsMixin:
+    def _handle_maintenance_command(self, command):
+        from hermes_cli.maintenance_host import handle_command
+        try:
+            handle_command(self, command, display=lambda text: self._console_print(_escape(text)))
+        except (ValueError, OSError) as exc:
+            self._console_print(_escape(str(exc)))
+        return True
+
     """Mixin holding the interactive-CLI slash-command handlers."""
 
     # ---- /rollback ------------------------------------------------------------------------

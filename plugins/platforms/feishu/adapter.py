@@ -1589,6 +1589,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
+        from hermes_maintenance_channel import revoke_adapter_channels
+        revoke_adapter_channels(self)
         self._running = False
         if self._ws_supervisor is not None:
             self._ws_supervisor.cancel()
@@ -1702,6 +1704,21 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
+        if (metadata or {}).get('maintenance_single_attempt') is True:
+            # The journal owns recovery. One text chunk, one physical attempt;
+            # no post fallback or SDK/adapter retry after an unknown send.
+            if not formatted or len(formatted) > self.MAX_MESSAGE_LENGTH:
+                return SendResult(success=False, error='MAINTENANCE_TEXT_BOUND_EXCEEDED')
+            try:
+                response = await self._send_raw_message(chat_id=chat_id, msg_type='text',
+                    payload=json.dumps({'text': content}, ensure_ascii=False),
+                    reply_to=reply_to, metadata=metadata)
+                result = self._finalize_send_result(response, 'maintenance send failed')
+                if result.success and not result.message_id:
+                    return SendResult(success=False, error='MAINTENANCE_PLATFORM_REF_UNAVAILABLE')
+                return result
+            except Exception:
+                return SendResult(success=False, error='MAINTENANCE_SEND_UNCERTAIN')
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         # Decide markdown-vs-text once for the whole message: a chunk of a long
         # markdown reply may be plain prose that fails the per-chunk regex and would
@@ -2741,6 +2758,7 @@ class FeishuAdapter(BasePlatformAdapter):
         control_kind = {
             "queue": "explicit_queue", "steer": "explicit_steer",
             "retry": "retry_previous_input",
+            "maintenance": "maintenance_inbox_read",
         }.get(normalized.get_command())
         if (getattr(sender, "sender_type", None) == "user" and raw_message_type in ("text", "post")
                 and not is_bot and (inbound_type != MessageType.COMMAND or control_kind)

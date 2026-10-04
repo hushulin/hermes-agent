@@ -7,7 +7,7 @@ opens a SessionDB or a Mem0 provider.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import json
 import hashlib
 import inspect
@@ -19,7 +19,7 @@ from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
 from run_agent import AIAgent
-from .transport import CompletedUsageInterrupted
+from .transport import CompletedUsageInterrupted, PriceQuote, CoreSingleAttemptTransport
 
 
 TOOL_NAMES = (
@@ -165,7 +165,7 @@ class PersistentBudgetLedger(Protocol):
 
     def reserve(self, task_id: str, dimension: str, amount: int | float, ceiling: int | float) -> bool: ...
     def record(self, task_id: str, dimension: str, amount: int | float) -> None: ...
-    def begin_attempt(self, task_id: str) -> int: ...
+    def begin_attempt(self, task_id: str, *, cost_contract: Mapping[str, Any] | None = None) -> int: ...
     def settle_actual(self, attempt_id: int, dimension: str, amount: int | float | None) -> bool: ...
     def snapshot(self, task_id: str) -> Mapping[str, int | float]: ...
 
@@ -382,6 +382,16 @@ class RestrictedReasoningRunner:
         self._check_live()
         if self._agent is None:
             raise RuntimeError("agent not attached")
+        if self.ledger.snapshot(self.task.task_id).get("accounting_dispatch_stopped", 0):
+            self._stop_reason = "usage_unreconciled"
+            raise ToolBudgetExceeded(self._stop_reason)
+        prepare = getattr(self.transport, "prepare_request", None)
+        if callable(prepare):
+            try:
+                request = prepare(request, self._agent)
+            except (TypeError, ValueError):
+                self._stop_reason = "request_bound_unavailable"
+                raise ToolBudgetExceeded(self._stop_reason) from None
         fingerprints = frozenset((e.source_kind, e.exact_reference, e.digest, e.status) for e in self.evidence)
         if self._last_evidence_fingerprints == fingerprints and self.ledger.snapshot(self.task.task_id).get("model_requests", 0):
             self._no_progress += 1
@@ -418,20 +428,63 @@ class RestrictedReasoningRunner:
         } != set(TOOL_NAMES) or len(wire_tools) != len(TOOL_NAMES):
             self._stop_reason = "tool_surface_changed"
             raise ToolBudgetExceeded("restricted tool surface changed")
-        bound = self.transport.input_token_upper_bound(request, self.route)
-        if not _positive_int(bound):
+        if self.route.api_mode == "chat_completions":
+            caps = [request[key] for key in ("max_tokens", "max_completion_tokens") if key in request]
+            if not caps or not all(_positive_int(v) and v <= self.route.max_output_tokens for v in caps):
+                self._stop_reason = "output_bound_unavailable"
+                raise ToolBudgetExceeded(self._stop_reason)
+        accounting = {"accounting_mode": "metered", "accounting_version": "metered-price-v1"}
+        if isinstance(self.transport, CoreSingleAttemptTransport):
+            try:
+                accounting = self.transport.accounting_contract(self.route)
+            except (TypeError, ValueError):
+                self._stop_reason = "accounting_unapproved"
+                stop = getattr(self.ledger, "stop_accounting", None)
+                if callable(stop):
+                    stop(self.task.task_id, self._stop_reason)
+                raise ToolBudgetExceeded(self._stop_reason) from None
+        client_budget = None
+        try:
+            account = accounting.get("subscription_contract", {})
+            if account.get("input_policy_version") == "client-budget-v1":
+                client_budget = self.transport.client_input_budget(request, self.route)
+                bound = client_budget["token_estimate"]
+            else:
+                bound = self.transport.input_token_upper_bound(request, self.route)
+            if not _positive_int(bound):
+                raise ValueError("positive input admission required")
+        except (TypeError, ValueError):
             self._stop_reason = "input_bound_unavailable"
-            raise ToolBudgetExceeded("input token bound unavailable")
+            raise ToolBudgetExceeded(self._stop_reason) from None
         cost = self.transport.cost_upper_bound(bound, self.route.max_output_tokens, self.route)
-        if not _finite_number(cost, positive=True):
+        subscription = accounting["accounting_mode"] == "subscription"
+        if not subscription and not _finite_number(cost, positive=True):
             self._stop_reason = "cost_bound_unavailable"
             raise ToolBudgetExceeded("cost bound unavailable")
         # Reserve a full output window; no speculative refund across restart.
+        if client_budget and (self.limits.model_requests > client_budget["request_limit"] or
+                self.limits.elapsed_seconds > client_budget["deadline_seconds"]):
+            raise ToolBudgetExceeded("host limits exceed approved client budget")
         self._reserve("model_requests", 1)
         self._reserve("input_tokens", bound)
         self._reserve("output_tokens", self.route.max_output_tokens)
-        self._reserve("cost_usd", cost)
-        attempt_id = self.ledger.begin_attempt(self.task.task_id)
+        if not subscription:
+            self._reserve("cost_usd", cost)
+        quote = getattr(self.transport, "price", None)
+        output_cap = getattr(self.transport, "physical_output_cap", None)
+        contract = {
+            **accounting,
+            "route": {"provider": self.route.provider, "model": self.route.model,
+                      "api_mode": self.route.api_mode, "service_tier": request.get("service_tier")},
+            "price": asdict(quote) if isinstance(quote, PriceQuote) else None,
+            "approved_price_version": getattr(self.transport, "approved_price_version", None),
+            "client_budget": client_budget,
+            "bounds_kind": "OBSERVED_USAGE_BUDGET" if client_budget else "STRICT_UPPER_BOUND",
+            "bounds": {"input_tokens": self.limits.input_tokens if client_budget else bound, "output_tokens": self.route.max_output_tokens,
+                       "cost_usd": cost},
+            "physical_output_cap": bool(output_cap(request, self.route)) if callable(output_cap) else False,
+        }
+        attempt_id = self.ledger.begin_attempt(self.task.task_id, cost_contract=contract)
         if type(attempt_id) is not int or attempt_id < 1:
             raise RuntimeError("durable attempt identity required before dispatch")
         try:
@@ -440,7 +493,7 @@ class RestrictedReasoningRunner:
             # Only a controlled numeric envelope may survive an interrupted
             # response. Never retain the response body or exception text.
             measured = exc.usage if isinstance(exc, CompletedUsageInterrupted) else {}
-            self._settle_usage(attempt_id, measured)
+            self._settle_usage(attempt_id, measured, contract["bounds"])
             self._stop_reason = ("cancelled" if self.cancelled() else
                                  "deadline" if time.monotonic() >= self.deadline else "model_response_unknown")
             raise ToolBudgetExceeded(self._stop_reason) from None
@@ -453,18 +506,8 @@ class RestrictedReasoningRunner:
             measured["cost_usd"] = self.transport.actual_cost(response, self.route)
         except Exception:
             measured["cost_usd"] = None
-        valid = {
-            "input_tokens": lambda v: type(v) is int and v >= 0,
-            "output_tokens": lambda v: type(v) is int and v >= 0,
-            "cost_usd": lambda v: _finite_number(v),
-        }
-        incomplete = self._settle_usage(attempt_id, measured)
-        if incomplete:
-            self._stop_reason = "usage_unavailable"
-        if ((valid["input_tokens"](measured["input_tokens"]) and measured["input_tokens"] > bound)
-            or (valid["output_tokens"](measured["output_tokens"]) and measured["output_tokens"] > self.route.max_output_tokens)
-            or (valid["cost_usd"](measured["cost_usd"]) and measured["cost_usd"] > cost)):
-            self._stop_reason = "usage_exceeded"
+        incomplete = self._settle_usage(attempt_id, measured, contract["bounds"])
+        if self._stop_reason == "usage_exceeded":
             raise ToolBudgetExceeded("provider exceeded reserved bound")
         if incomplete:
             raise ToolBudgetExceeded("actual usage incomplete")
@@ -487,7 +530,7 @@ class RestrictedReasoningRunner:
         self._check_live()
         return response
 
-    def _settle_usage(self, attempt_id: int, measured: Mapping[str, Any]) -> bool:
+    def _settle_usage(self, attempt_id: int, measured: Mapping[str, Any], bounds: Mapping[str, Any]) -> bool:
         valid = {
             "input_tokens": lambda v: type(v) is int and v >= 0,
             "output_tokens": lambda v: type(v) is int and v >= 0,
@@ -495,11 +538,18 @@ class RestrictedReasoningRunner:
         }
         incomplete = False
         for dimension, check in valid.items():
+            if dimension == "cost_usd" and bounds[dimension] is None:
+                self.ledger.settle_actual(attempt_id, dimension, None)
+                continue
             value = measured.get(dimension)
             if not check(value):
                 incomplete = True
                 value = None
+            elif value > bounds[dimension]:
+                self._stop_reason = "usage_exceeded"
             self.ledger.settle_actual(attempt_id, dimension, value)
+        if incomplete and self._stop_reason != "usage_exceeded":
+            self._stop_reason = "usage_unavailable"
         return incomplete
 
     def _handle_tool(self, name: str, args: dict[str, Any]) -> str:

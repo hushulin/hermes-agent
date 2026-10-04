@@ -78,6 +78,12 @@ class CLITuiRuntimeMixin:
 
         raw_authored_input = authored_raw_input or (user_input if isinstance(user_input, str) else None)
 
+        if (not is_voice_input and not is_seeded_query and authored_reuse is None
+                and not submit_images and isinstance(raw_authored_input, str)):
+            from hermes_cli.maintenance_host import consume_bare_consent
+            if consume_bare_consent(self, raw_authored_input):
+                return
+
         if isinstance(user_input, str):
             user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
             user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
@@ -301,6 +307,10 @@ class CLITuiRuntimeMixin:
         except Exception:
             pass
         self._console_print(f"[{_welcome_color}]{_welcome_text}[/]")
+
+        with suppress(ValueError, OSError):
+            from hermes_cli.maintenance_host import notify_pending
+            notify_pending(self)
 
         self._tui_startup_prewarm_and_warnings(_welcome_skin)
         self._print_random_tip()
