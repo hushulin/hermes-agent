@@ -7,6 +7,8 @@ from time import time as wall_time
 from uuid import uuid4
 from typing import Any, List, Mapping, MutableMapping, Optional, TypeVar
 
+from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
+
 
 # These fields describe Hermes' durable record and timeline display, not
 # provider-visible message content. The request builder strips them from every
