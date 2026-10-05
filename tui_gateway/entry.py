@@ -270,6 +270,12 @@ def _write_or_exit(payload: dict, reason: str) -> None:
         sys.exit(0)
 
 
+def _dispatch_stdio_request(request):
+    from hermes_maintenance_tui import stdio_prompt_request
+    with stdio_prompt_request(request, server._stdio_transport):
+        return dispatch(request)
+
+
 def main():
     # stdout is this process's JSON-RPC client channel: peer-less global broadcasts belong on it.
     server._stdio_is_rpc_channel = True
@@ -344,7 +350,7 @@ def main():
 
         method = req.get("method") if isinstance(req, dict) else None
         try:
-            resp = dispatch(req)
+            resp = _dispatch_stdio_request(req)
         except Exception as exc:
             # Pool-routed handlers already turn failures into this response; keep an
             # inline handler from taking down the stdio reader before it can reply.

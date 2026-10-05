@@ -949,6 +949,10 @@ def _ensure_source_projections(conn):
 
 def bind_committed_source(conn, db_path, session_id, row_id, receipt):
     """Insert immutable evidence and outbox inside the message writer transaction."""
+    from hermes_maintenance_tui import TuiSessionReceipt, bind_tui_session_receipt
+    if type(receipt) is TuiSessionReceipt:
+        bind_tui_session_receipt(conn, db_path, session_id, row_id, receipt)
+        return None  # A read-only identity is never an enrolled maintenance source.
     if type(receipt) is SourceBundle and receipt.seal is _SEAL:
         if not receipt.receipts or not all(type(r) is SourceReceipt and r.seal is _SEAL
                                            for r in receipt.receipts):
