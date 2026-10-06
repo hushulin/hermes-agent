@@ -39,6 +39,17 @@ NO_PROGRESS_STRIKES = 2
 NO_PROGRESS_STRIKES_AFTER_REJECTED_PROPOSAL = 3
 
 
+def _host_submit_detail(exc: Exception) -> str:
+    """Bounded, printable reason read off a host submission failure.
+
+    Preserves the plugin's own code (its ValueErrors carry stable codes) without letting an
+    arbitrary exception text reach the journal: first line only, printable ASCII, 64 chars.
+    """
+    text = str(exc).strip().splitlines()[0].strip() if str(exc).strip() else ""
+    keep = "".join(ch for ch in text if 32 <= ord(ch) < 127)[:64]
+    return keep or type(exc).__name__
+
+
 def _positive_int(value: Any) -> bool:
     return type(value) is int and value > 0
 
@@ -763,8 +774,14 @@ class RestrictedReasoningRunner:
         try:
             receipt = self.handlers.submit_proposal(submission)
         except Exception as exc:
-            self._stop_reason = "host_submit_failed"
-            raise RuntimeError("host_submit_failed:" + type(exc).__name__) from None
+            # Keep the host's own reason code. The plugin raises stable, actionable ValueError
+            # codes (e.g. 'read_budget_exhausted', 'STRUCTURED_PROPOSAL_ITEM_SCHEMA_INVALID');
+            # collapsing every one of them into the exception TYPE made the failure
+            # undiagnosable from the journal and turned a shaping slip into an opaque stop.
+            detail = _host_submit_detail(exc)
+            logger.warning("host proposal submission failed: %s (%s)", detail, type(exc).__name__)
+            self._stop_reason = "host_submit_failed:" + detail
+            raise RuntimeError("host_submit_failed:" + detail) from None
         if not isinstance(receipt, str) or not receipt:
             self._stop_reason = "host_submit_uncertain"
             raise ValueError("proposal receipt invalid")

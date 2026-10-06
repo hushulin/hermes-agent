@@ -311,6 +311,36 @@ def test_rejected_proposal_attempt_earns_one_bounded_correction(fake_route):
     assert len(transport.requests) >= 4, "the rejected attempt must not end the run"
 
 
+def test_host_submit_failure_keeps_the_host_reason_code(fake_route):
+    """P15: the host's own failure code survives instead of collapsing to
+    'host_submit_failed:ValueError', which made the live 20:33 stop undiagnosable."""
+    import dataclasses
+    from agent.memory_reasoning import runner as runner_mod
+
+    # The helper is the whole contract: keep the code, never leak raw text.
+    assert runner_mod._host_submit_detail(ValueError('read_budget_exhausted')) == 'read_budget_exhausted'
+    assert runner_mod._host_submit_detail(ValueError()) == 'ValueError'
+    assert runner_mod._host_submit_detail(RuntimeError('bad\nsecond line')) == 'bad'
+
+    def refuse(submission):
+        raise ValueError('STRUCTURED_PROPOSAL_ITEM_SCHEMA_INVALID')
+
+    submission = {"action": "UPDATE", "evidence_refs": ["memory:1"]}
+    transport = RecordingTransport([
+        response([call("reason_memory_search", {"query": "project database"})]),
+        response([call("reason_proposal_submit", {"proposal": submission})]),
+        response(content="done"),
+    ])
+    job = build_runner(script=None, document_read=lambda r, m: Evidence_memory(m),
+                       transport=transport)
+    job.handlers = dataclasses.replace(job.handlers, submit_proposal=refuse)
+    result = job.run()
+
+    assert job._stop_reason == 'host_submit_failed:STRUCTURED_PROPOSAL_ITEM_SCHEMA_INVALID'
+    assert result.status == "restricted_failure", result.status
+    assert "STRUCTURED_PROPOSAL_ITEM_SCHEMA_INVALID" in result.answer, result.answer
+
+
 def test_thinking_only_truncation_continuation_keeps_the_approved_wire_profile(fake_route):
     """P11: a thinking-only truncation continues on the SAME approved effort and cap.
 
