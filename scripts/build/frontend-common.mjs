@@ -121,7 +121,7 @@ export function publishDirectory(staged, out, { source } = {}) {
     if (previous) renameProduct(backup, out)
     throw error
   }
-  rmSync(backupRoot, { recursive: true, force: true })
+  if (previous) rmSync(backup, { recursive: true, force: true })
 }
 
 export async function withProduct(out, compile, { source } = {}) {
