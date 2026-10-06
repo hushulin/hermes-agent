@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 import json
 import hashlib
 import inspect
+import logging
 import math
 import threading
 import time
@@ -20,6 +21,8 @@ from uuid import uuid4
 
 from run_agent import AIAgent
 from .transport import CompletedUsageInterrupted, PriceQuote, CoreSingleAttemptTransport
+
+logger = logging.getLogger(__name__)
 
 
 TOOL_NAMES = (
@@ -530,16 +533,49 @@ class RestrictedReasoningRunner:
                     args = json.loads(raw) if isinstance(raw, str) else raw
                 except (TypeError, ValueError):
                     args = None
-                if name not in TOOL_NAMES or not isinstance(args, dict) or set(args) != {_FIELDS.get(name)}:
+                if name not in TOOL_NAMES:
+                    logger.warning("restricted tool call refused: %s",
+                                   self._call_shape(name, args))
                     self._stop_reason = "forbidden_tool"
                     raise ToolBudgetExceeded("forbidden or malformed tool call")
-                try:
-                    json.dumps(args, allow_nan=False)
-                except (TypeError, ValueError):
-                    self._stop_reason = "malformed_tool"
-                    raise ToolBudgetExceeded("non-JSON tool arguments") from None
+                malformed = self._malformed_arguments(name, args)
+                if malformed is not None:
+                    # An allowed tool with a wrong-shaped call is rejected back to the
+                    # model: nothing is dispatched, no logical tool is charged, and the
+                    # loop stays inside the existing model/logical-tool budgets.
+                    logger.warning("restricted tool call rejected (%s): %s", malformed,
+                                   self._call_shape(name, args))
         self._check_live()
         return response
+
+    @staticmethod
+    def _malformed_arguments(name: str, args: Any) -> str | None:
+        """Rejection reason when an allowed tool's call shape is wrong, else None.
+
+        A malformed call is never dispatched and never charges a logical tool; only a
+        name outside ``TOOL_NAMES`` stays a task-level governance stop.
+        """
+        if not isinstance(args, dict) or set(args) != {_FIELDS.get(name)}:
+            return "malformed_arguments"
+        try:
+            json.dumps(args, allow_nan=False)
+        except (TypeError, ValueError):
+            return "malformed_arguments"
+        return None
+
+    @staticmethod
+    def _rejection_json(name: str) -> str:
+        return json.dumps({"status": "rejected", "reason": "malformed_arguments",
+                           "expected": _FIELDS[name]})
+
+    @staticmethod
+    def _call_shape(name: Any, args: Any) -> str:
+        """Bounded structural description for logs: tool name and argument KEY names only."""
+        tool = str(name)[:64] if name is not None else "<none>"
+        if isinstance(args, dict):
+            keys = ",".join(sorted(str(key)[:32] for key in args)[:8])
+            return f"name={tool} keys=[{keys}] arg_count={len(args)}"
+        return f"name={tool} args_type={type(args).__name__}"
 
     def _settle_usage(self, attempt_id: int, measured: Mapping[str, Any], bounds: Mapping[str, Any]) -> bool:
         valid = {
@@ -564,9 +600,14 @@ class RestrictedReasoningRunner:
         return incomplete
 
     def _handle_tool(self, name: str, args: dict[str, Any]) -> str:
-        if name not in TOOL_NAMES or not isinstance(args, dict) or set(args) != {_FIELDS.get(name)}:
+        if name not in TOOL_NAMES:
+            logger.warning("restricted tool call refused: %s", self._call_shape(name, args))
             self._stop_reason = "forbidden_tool"
             raise ValueError("unknown or malformed restricted call")
+        if self._malformed_arguments(name, args) is not None:
+            logger.warning("restricted tool call rejected (malformed_arguments): %s",
+                           self._call_shape(name, args))
+            return self._rejection_json(name)
         value = args[_FIELDS[name]]
         if name == "reason_proposal_submit" and self._proposal_state == "uncertain":
             with self._proposal_lock:

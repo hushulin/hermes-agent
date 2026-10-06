@@ -14,13 +14,14 @@ P5: the between-turns registry refresh must never rebuild this agent's
 from collections import defaultdict
 from types import SimpleNamespace
 import json
+import logging
 import threading
 import time
 
 import pytest
 
 from agent.memory_reasoning import (
-    BudgetLimits, HostHandlers, ReasoningTask, RestrictedReasoningRunner, Route,
+    BudgetLimits, Evidence, HostHandlers, ReasoningTask, RestrictedReasoningRunner, Route,
 )
 from agent.memory_reasoning.document_reader import (
     LocalDocumentGrant, ScopedDocumentEvidenceReader,
@@ -108,10 +109,10 @@ class RecordingTransport:
         return self.script.pop(0)
 
 
-def build_runner(*, script, document_read, transport=None):
+def build_runner(*, script, document_read, transport=None, memory_search=None):
     task = ReasoningTask("task-1", "owner-1", "rev-1", "Host context")
     handlers = HostHandlers(
-        memory_search=lambda q, meter: Evidence_memory(meter),
+        memory_search=memory_search or (lambda q, meter: Evidence_memory(meter)),
         exact_read=lambda r, meter: Evidence_memory(meter),
         source_trace=lambda r, meter: Evidence_memory(meter),
         document_read=document_read,
@@ -184,3 +185,69 @@ def test_turn_start_mcp_refresh_cannot_empty_restricted_tool_surface(fake_route,
     assert len(transport.requests) == 1, "the restricted request was never dispatched"
     sent = transport.requests[0]["tools"]
     assert [tool["function"]["name"] for tool in sent] == list(TOOL_NAMES)
+
+
+def test_malformed_arguments_are_rejected_without_aborting_the_task(fake_route, caplog):
+    """P8: a wrong-shaped call for an ALLOWED tool is rejected back to the model.
+
+    Nothing is dispatched, no logical tool is charged, the loop stays inside its
+    budget, and a name outside the surface still stops the task.
+    """
+    seen = []
+
+    def search(query, meter):
+        meter()
+        seen.append(query)
+        return Evidence("memory", "memory:1", "sha256:t", "line:1", "2026-10-01T00:00:00Z",
+                        "complete", "bounded exact read", {"text": query})
+
+    transport = RecordingTransport([
+        response([call("reason_memory_search", {"query": "first", "unexpected_key": 1})]),
+        response([call("reason_memory_search", {"query": "second"})]),
+        response(content="recovered after the rejected call"),
+    ])
+    job = build_runner(script=None, document_read=lambda r, m: Evidence_memory(m),
+                       transport=transport, memory_search=search)
+    with caplog.at_level(logging.WARNING, logger="agent.memory_reasoning.runner"):
+        result = job.run()
+
+    assert result.status != "restricted_failure", result.answer
+    assert result.answer == "recovered after the rejected call"
+    assert seen == ["second"], "the malformed call must never reach the host handler"
+    assert result.usage.get("logical_tools", 0) == 1
+    assert result.usage.get("underlying_reads", 0) == 1
+    assert len(transport.requests) == 3
+    # Bounded structural log: tool name and argument keys, never the argument values.
+    assert "rejected (malformed_arguments)" in caplog.text
+    assert "unexpected_key" in caplog.text and "first" not in caplog.text
+
+
+def test_foreign_tool_name_still_aborts_the_task(fake_route):
+    """P8: a name OUTSIDE the restricted surface stays fatal — the surface invariant."""
+    transport = RecordingTransport([response([call("terminal", {"command": "echo unsafe"})])])
+    job = build_runner(script=None, document_read=lambda r, m: Evidence_memory(m),
+                       transport=transport)
+    result = job.run()
+    assert result.status == "restricted_failure"
+    assert "forbidden or malformed tool call" in result.answer
+    assert result.usage.get("logical_tools", 0) == 0
+    assert len(transport.requests) == 1
+
+
+def test_compaction_boundary_refresh_honours_the_surface_opt_out(monkeypatch):
+    """P8 (defence in depth): the compaction-boundary rebuild obeys the same opt-out."""
+    import agent.conversation_compression as cc
+
+    calls = []
+
+    def record(*args, **kwargs):
+        calls.append(args)
+        return set()
+
+    monkeypatch.setattr("tools.mcp_tool_agent.refresh_agent_mcp_tools", record)
+
+    assert cc._refresh_agent_tool_definitions(SimpleNamespace(_skip_mcp_refresh=True)) is False
+    assert calls == [], "an opted-out instance must not be rebuilt from the registry"
+
+    assert cc._refresh_agent_tool_definitions(SimpleNamespace(_skip_mcp_refresh=False)) is False
+    assert len(calls) == 1, "ordinary agents keep the compaction-boundary refresh"

@@ -243,11 +243,12 @@ def test_real_loop_search_read_submit(fake_route):
     assert not (Path(os.environ["HERMES_HOME"]) / "MEMORY.md").exists()
 
 
-def test_forbidden_tool_and_malformed_wrapper_never_dispatch(fake_route):
+def test_forbidden_tool_names_never_dispatch(fake_route):
+    """A name outside the restricted surface stays a task-level stop (fail-closed)."""
     for name, args in [
         ("terminal", {"command": "echo unsafe"}),
         ("tool_search", {"name": "terminal"}),
-        ("reason_exact_read", {"reference": "session:ok", "profile": "other"}),
+        ("reason_exact_read_v2", {"reference": "session:ok"}),
     ]:
         events, ledger = [], Ledger()
         job = runner([response([call(name, args)])], ledger, events)
@@ -688,7 +689,14 @@ def test_sent_response_records_known_actual_usage_even_when_rejected(fake_route,
         if kind == "error":
             job.transport.complete = lambda *_: (_ for _ in ()).throw(RuntimeError("lost response"))
         result = job.run()
-        assert result.status in {"restricted_failure", "failed"}
+        if kind == "malformed":
+            # A wrong-shaped call for an ALLOWED tool is now rejected back to the model
+            # instead of killing the job; this case still pins the accounting intent:
+            # the sent response's known actual usage must be settled either way.
+            assert result.status == "needs_evidence"
+            assert not job.transport.script, "the rejected call must end the scripted turn"
+        else:
+            assert result.status in {"restricted_failure", "failed"}
         assert result.usage["model_requests"] == 1
     finally:
         ledger.close()
