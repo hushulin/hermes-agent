@@ -11,7 +11,7 @@ from pathlib import Path
 import stat
 from typing import Callable, Mapping
 
-from .runner import Evidence, ToolBudgetExceeded, _positive_int
+from .runner import Evidence, ToolBudgetExceeded, _bounded_reference, _positive_int
 
 
 _TEXT_SUFFIXES = frozenset({".txt", ".md", ".markdown"})
@@ -116,7 +116,13 @@ class ScopedDocumentEvidenceReader:
 
     def read(self, reference: str, reserve_read: Callable[[], None]) -> Evidence:
         if not isinstance(reference, str) or reference not in self._grants:
-            raise PermissionError("document reference outside host-bound scope")
+            # A reference outside the host's grants is a rejected read, not a task
+            # abort: charge the read and return the same error envelope the other
+            # unreadable-document paths use (never bindable as proposal evidence).
+            reserve_read()
+            return self._evidence(_bounded_reference(reference), "unbound", "error",
+                                  "document reference outside host-bound scope; no bytes read",
+                                  {"error_type": "PermissionDenied"})
         grant = self._grants[reference]
         # Charge the underlying read before stat, path traversal, or open.
         reserve_read()

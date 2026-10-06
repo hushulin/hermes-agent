@@ -286,10 +286,12 @@ def test_scoped_session_reader_reuses_read_shape_without_cross_scope(tmp_path, m
             db_path=db_path, owner_key="owner-1",
             allowed_session_ids=frozenset({"allowed", "missing", "long"}),
         ) as reader:
-            with pytest.raises(PermissionError):
-                reader.read("session:other")
-            with pytest.raises(ValueError):
-                reader.read(str(tmp_path / "elsewhere"))
+            out_of_scope = reader.read("session:other")
+            assert (out_of_scope.status, out_of_scope.content["error_type"]) == ("error", "PermissionDenied")
+            assert out_of_scope.underlying_reads == 1
+            malformed = reader.read(str(tmp_path / "elsewhere"))
+            assert (malformed.status, malformed.content["error_type"]) == ("error", "PermissionDenied")
+            assert malformed.underlying_reads == 1
             found = reader.search("Alpha")
             assert found.status == "missing"  # one approved session does not exist
             assert found.content["hits"][0]["session_id"] == "allowed"

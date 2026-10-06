@@ -10,7 +10,7 @@ from typing import Callable
 
 from hermes_state import SessionDB
 
-from .runner import Evidence, ToolBudgetExceeded, _positive_int
+from .runner import Evidence, ToolBudgetExceeded, _bounded_reference, _positive_int
 
 
 class ScopedSessionEvidenceReader:
@@ -110,10 +110,17 @@ class ScopedSessionEvidenceReader:
 
     def read(self, reference: str, reserve_read: Callable[[], None] = lambda: None) -> Evidence:
         if not isinstance(reference, str) or not reference.startswith("session:"):
-            raise ValueError("session reference required")
+            # A malformed or out-of-scope session reference is a rejected read, not a
+            # task abort: charge the read and return the error envelope (status error,
+            # so it can never be bound as proposal evidence).
+            reserve_read()
+            return self._envelope(_bounded_reference(reference), {"error_type": "PermissionDenied"},
+                                  "error", "not host-bound session reference; no rows read", 1)
         session_id = reference.removeprefix("session:")
         if session_id not in self.allowed_session_ids:
-            raise PermissionError("session outside host-bound scope")
+            reserve_read()
+            return self._envelope(_bounded_reference(reference), {"error_type": "PermissionDenied"},
+                                  "error", "session outside host-bound scope; no rows read", 1)
         measured_reads = 0
 
         def metered():

@@ -33,6 +33,17 @@ def _positive_int(value: Any) -> bool:
     return type(value) is int and value > 0
 
 
+_MAX_REFERENCE_CHARS = 200
+
+
+def _bounded_reference(value: Any) -> str:
+    """Host-visible form of a model-supplied reference: bounded, never a full echo."""
+    if not isinstance(value, str):
+        return "<non-string>"
+    text = value.strip()
+    return text[:_MAX_REFERENCE_CHARS] if text else "<empty>"
+
+
 def _finite_number(value: Any, *, positive: bool = False) -> bool:
     return type(value) in (int, float) and math.isfinite(value) and (value > 0 if positive else value >= 0)
 
