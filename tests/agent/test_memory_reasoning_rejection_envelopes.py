@@ -263,6 +263,54 @@ def test_compaction_boundary_refresh_honours_the_surface_opt_out(monkeypatch):
     assert len(calls) == 1, "ordinary agents keep the compaction-boundary refresh"
 
 
+def test_plain_spin_still_stops_at_two_strikes(fake_route):
+    """P14 (invariant): evidence-less spinning that never tried to submit still stops at 2."""
+    transport = RecordingTransport([
+        response([call("reason_memory_search", {"query": "project database"})]),
+        response([call("reason_exact_read", {"reference": "source:not-this-task"})]),
+        response([call("reason_exact_read", {"reference": "source:not-this-task"}, 2)]),
+        response(content="unused"),
+    ])
+    job = build_runner(script=None, document_read=lambda r, m: Evidence_memory(m),
+                       transport=transport)
+    result = job.run()
+    # The runner maps any ToolBudgetExceeded to "budget_exhausted"; the worker then reports
+    # it as BUDGET_EXHAUSTED, which is why P12 read the guard as a budget stop.
+    assert result.status == "budget_exhausted"
+    assert "no_progress" in result.answer
+    assert len(transport.requests) == 3, "the third send must be the last one dispatched"
+    assert result.proposal_receipt is None
+
+
+def test_rejected_proposal_attempt_earns_one_bounded_correction(fake_route):
+    """P14: when the SECOND consecutive no-evidence send carried a rejected submission
+    attempt, the guard allows one more send — and a valid submission in it still forms the
+    proposal. This mirrors the live sequence (strike 1 from a bare no-evidence send, strike 2
+    from the send whose proposal was rejected for shape)."""
+    malformed = call("reason_proposal_submit", {"proposal": {"action": "UPDATE"}})
+    # Mirrors the live signature: the arguments PARSE but are not an object, so the call is
+    # rejected by shape without the loop treating the action as cut off.
+    malformed.function.arguments = "null"
+    # The runner only accepts a proposal whose evidence_refs it can resolve against what it
+    # actually read (the search below serves memory:1).
+    submission = {"action": "UPDATE", "evidence_refs": ["memory:1"]}
+    transport = RecordingTransport([
+        response([call("reason_memory_search", {"query": "project database"})]),
+        response([call("reason_exact_read", {"reference": "source:not-this-task"})]),
+        response([malformed]),
+        response([call("reason_proposal_submit", {"proposal": submission})]),
+        response(content="done"),
+    ])
+    job = build_runner(script=None, document_read=lambda r, m: Evidence_memory(m),
+                       transport=transport)
+    result = job.run()
+
+    assert result.status != "restricted_failure", result.answer
+    assert result.proposal_receipt, result.status
+    assert result.status == "proposal_submitted"
+    assert len(transport.requests) >= 4, "the rejected attempt must not end the run"
+
+
 def test_thinking_only_truncation_continuation_keeps_the_approved_wire_profile(fake_route):
     """P11: a thinking-only truncation continues on the SAME approved effort and cap.
 

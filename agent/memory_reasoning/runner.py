@@ -30,6 +30,13 @@ TOOL_NAMES = (
     "reason_document_read", "reason_proposal_submit",
 )
 READ_NAMES = frozenset(TOOL_NAMES[:4])
+# Convergence guard: consecutive sends whose evidence fingerprint did not change.
+NO_PROGRESS_STRIKES = 2
+# One bounded correction: when the send that just returned TRIED to submit a proposal and was
+# rejected for its shape, the model gets exactly one more send to fix its JSON before the
+# guard stops the task (P8 already handed it an actionable rejection). Every other form of
+# spinning still stops at NO_PROGRESS_STRIKES.
+NO_PROGRESS_STRIKES_AFTER_REJECTED_PROPOSAL = 3
 
 
 def _positive_int(value: Any) -> bool:
@@ -351,6 +358,7 @@ class RestrictedReasoningRunner:
         self.proposal_receipt: str | None = None
         self._last_evidence_fingerprints: frozenset[tuple] = frozenset()
         self._no_progress = 0
+        self._last_send_rejected_proposal = False
         self._stop_reason: str | None = None
         self._parallel_slots = threading.BoundedSemaphore(limits.parallelism)
         self._active_tools = 0
@@ -407,12 +415,16 @@ class RestrictedReasoningRunner:
                 self._stop_reason = "request_bound_unavailable"
                 raise ToolBudgetExceeded(self._stop_reason) from None
         fingerprints = frozenset((e.source_kind, e.exact_reference, e.digest, e.status) for e in self.evidence)
+        rejected_proposal = self._last_send_rejected_proposal
+        self._last_send_rejected_proposal = False
         if self._last_evidence_fingerprints == fingerprints and self.ledger.snapshot(self.task.task_id).get("model_requests", 0):
             self._no_progress += 1
         else:
             self._no_progress = 0
         self._last_evidence_fingerprints = fingerprints
-        if self._no_progress >= 2 and not self.proposal_receipt:
+        strikes = (NO_PROGRESS_STRIKES_AFTER_REJECTED_PROPOSAL if rejected_proposal
+                   else NO_PROGRESS_STRIKES)
+        if self._no_progress >= strikes and not self.proposal_receipt:
             self._stop_reason = "no_progress"
             raise ToolBudgetExceeded("no_progress")
         configured_effort = self._agent.reasoning_config.get("effort") if isinstance(self._agent.reasoning_config, dict) else None
@@ -543,6 +555,10 @@ class RestrictedReasoningRunner:
                     # An allowed tool with a wrong-shaped call is rejected back to the
                     # model: nothing is dispatched, no logical tool is charged, and the
                     # loop stays inside the existing model/logical-tool budgets.
+                    if name == "reason_proposal_submit":
+                        # A submission attempt that only failed on shape earns the model one
+                        # bounded retry before the no-progress guard may stop the run.
+                        self._last_send_rejected_proposal = True
                     logger.warning("restricted tool call rejected (%s): %s", malformed,
                                    self._call_shape(name, args))
         self._check_live()
@@ -605,6 +621,8 @@ class RestrictedReasoningRunner:
             self._stop_reason = "forbidden_tool"
             raise ValueError("unknown or malformed restricted call")
         if self._malformed_arguments(name, args) is not None:
+            if name == "reason_proposal_submit":
+                self._last_send_rejected_proposal = True
             logger.warning("restricted tool call rejected (malformed_arguments): %s",
                            self._call_shape(name, args))
             return self._rejection_json(name)
