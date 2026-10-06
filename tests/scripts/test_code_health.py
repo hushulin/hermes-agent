@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from scripts.code_health import gitio, replay
 from scripts.code_health.cli import run
+from scripts.code_health.compare import compare
+from scripts.code_health.measure import Measurer
+from scripts.code_health.report import apply_allows
+from scripts.code_health.ruff_runner import resolve_ruff
 
 REPO = Path(__file__).resolve().parents[2]
 _LEGACY = "def legacy(x):\n" + "".join(f"    if x == {i}:\n        return {i}\n" for i in range(21))
@@ -169,3 +175,65 @@ def test_verdicts_follow_ownership_deadlines_and_import_execution(tmp_path, caps
         base = _commit(repo, extra_base)
     code, out = _verdict(repo, base, files, capsys)
     assert code == (1 if blocks else 0), out
+
+
+# --- replay: a range it could not measure is reported and fails the run, never counted clean ---
+
+
+def test_replay_reports_unmeasured_prs_and_fails(tmp_path, monkeypatch, capsys):
+    repo, base = _repo(tmp_path)
+    head = _commit(repo, {"pkg/b.py": _SWALLOW.replace("other", "fresh")})
+
+    def pr(number: int, oid: str) -> dict:
+        return {"number": number, "title": f"pr {number}", "mergeCommit": {"oid": oid},
+                "commits": {"totalCount": 1, "nodes": [{"commit": {"messageHeadline": "elsewhere"}}]}}
+
+    # #2's merge commit is not in the clone: building the manifest cannot resolve its range
+    monkeypatch.setattr(replay, "merged_prs", lambda *_: [pr(1, head), pr(2, "1" * 40)])
+    monkeypatch.chdir(repo)
+    out_dir = tmp_path / "out"
+    assert replay.main(["--merged", "2026-09-01..2026-09-30", "--out", str(out_dir)]) == 1
+    out = capsys.readouterr().out
+    assert "1 of 1 measured PRs had at least one blocking finding" in out, out
+    assert "1 of 2 PRs could not be measured: #2" in out, out
+
+    # a frozen manifest whose range no longer exists cannot be replayed either
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest.append({"number": 3, "title": "pr 3", "base": "0" * 40, "head": "1" * 40})
+    (tmp_path / "frozen.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert replay.main(["--manifest", str(tmp_path / "frozen.json"), "--out", str(out_dir)]) == 1
+    out = capsys.readouterr().out
+    assert "1 of 1 measured PRs had at least one blocking finding" in out, out
+    assert "2 of 3 PRs could not be measured: #2, #3" in out, out
+
+
+# --- a blob's line endings never move a hit, its scope or its waiver ---
+
+
+def _windows_write_text(self, data, encoding=None, errors=None, newline=None):
+    """``Path.write_text`` as on Windows, where ``newline=None`` turns each "\n" into "\r\n"."""
+    if newline is None:
+        data = data.replace("\n", "\r\n")
+    with open(self, "w", encoding=encoding, errors=errors, newline="") as fh:
+        return fh.write(data)
+
+
+def test_crlf_blob_measures_like_lf(tmp_path, monkeypatch):
+    waived = _SWALLOW.replace("except Exception:", "except Exception:  # health: allow BLE001 S110 -- boundary")
+    results = {}
+    for name, eol in (("lf", "\n"), ("crlf", "\r\n")):
+        repo, base = _repo(tmp_path / name)
+        _git(repo, "config", "core.autocrlf", "false")
+        (repo / "pkg/b.py").write_bytes(waived.replace("\n", eol).encode("utf-8"))
+        head = _commit(repo, {})
+        assert (eol == "\r\n") == (b"\r\n" in subprocess.run(
+            ["git", "show", f"{head}:pkg/b.py"], cwd=repo, capture_output=True, timeout=60, check=True).stdout)
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "write_text", _windows_write_text)
+            measurer = Measurer(repo, resolve_ruff(repo), known_env=set())
+            base_m, head_m = measurer.measure(base, []), measurer.measure(head, ["pkg/b.py"])
+        findings = compare(base_m, head_m, gitio.changed_files(repo, base, head))
+        apply_allows(findings, head_m)
+        results[name] = sorted((f.rule, f.scope, f.line, f.allowed_reason) for f in findings)
+    assert results["lf"] == [("BLE001", "other", 4, "boundary"), ("S110", "other", 4, "boundary")]
+    assert results["crlf"] == results["lf"]

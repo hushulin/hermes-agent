@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,8 +27,9 @@ _GUARD_SCRIPTS = (
     "scripts/check_no_tmp_literals.py", "scripts/check_config_yaml_writers.py",
     "scripts/ci/check_os_marker_fakes.py", "scripts/check-case-collisions.py",
     "scripts/ci/check_lazy_deps_imports.py", "scripts/ci/check_profile_archive_boundary.py",
+    "scripts/ci/check_agents_md_size.py",
 )
-_SUPPORT = ("scripts/ci/profile_scope_patterns.json", *_GUARD_SCRIPTS)
+_SUPPORT = ("scripts/ci/profile_scope_patterns.json", "agent/subdirectory_hints.py", *_GUARD_SCRIPTS)
 _LEGACY = "def legacy(x):\n" + "".join(f"    if x == {i}:\n        return {i}\n" for i in range(21))
 _GROWN = _LEGACY + "    if x == 99:\n        return 99\n"
 _ENV_COPY = "import os\n\n\ndef child_env():\n    env = os.environ.copy()\n    return env\n"
@@ -93,7 +95,7 @@ def _add_engine(repo: Path, checker: bool = True) -> list[str]:
         shutil.copy2(REPO / "scripts/check", repo / "scripts/check")
         shutil.copytree(REPO / "scripts/code_health", repo / "scripts/code_health",
                         ignore=shutil.ignore_patterns("__pycache__"), dirs_exist_ok=True)
-    return ["scripts", "tests"]
+    return ["agent", "scripts", "tests"]
 
 
 def _engine_repo(tmp_path: Path) -> Path:
@@ -108,6 +110,11 @@ def _engine_repo(tmp_path: Path) -> Path:
 
 def _check(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return _sh(repo, sys.executable, str(repo / "scripts/check"), *args)
+
+
+def _timeless(report: str) -> str:
+    """A report minus its elapsed time (`(0.1s)`), the one part two identical runs may differ in."""
+    return re.sub(r"\(\d+\.\ds\)", "", report)
 
 
 def _ratchet_repo(tmp_path: Path, switch: str | None = None) -> tuple[Path, str]:
@@ -147,7 +154,7 @@ def test_staged_health_ignores_unstaged_policy_and_engine(tmp_path, unstaged):
     assert edited != original
     (repo / rel).write_text(edited, encoding="utf-8")
     again = _check(repo, "--staged", "--only", "health", "--base", "HEAD")
-    assert again.stdout == first.stdout, again.stdout + again.stderr
+    assert _timeless(again.stdout) == _timeless(first.stdout), again.stdout + again.stderr
     # the judged artifact and the user's unstaged work are both untouched
     assert _git(repo, "write-tree") == tree
     assert (repo / rel).read_text(encoding="utf-8") == edited
@@ -337,6 +344,37 @@ def test_a_branch_cannot_relax_its_own_switch(tmp_path, monkeypatch, capsys):
     assert cli.main([]) == 1, capsys.readouterr().out
 
 
+# --- F23: the hooks under Git for Windows with MSYS path conversion disabled -----------------
+
+
+def test_hooks_run_with_msys_path_conversion_disabled(tmp_path):
+    """Hermes' Windows terminal exports both variables, so native git and python see the hook's
+    paths verbatim: a POSIX `/c/...` temp path then reaches them unconverted. Inert elsewhere."""
+    repo, remote = _pushable(tmp_path)
+    _branch_with_checker(repo, "feature", {"pkg/d.py": "def d():\n    return 4\n"})
+    for kind in ("pre-commit", "pre-push"):
+        assert _check(repo, "--install-hook", kind).returncode == 0
+    env = {**_env(), "MSYS_NO_PATHCONV": "1", "MSYS2_ARG_CONV_EXCL": "*"}
+
+    _write(repo, {"pkg/e.py": _SWALLOW})
+    _git(repo, "add", "--", "pkg/e.py")
+    commit = _sh(repo, "git", "commit", "-q", "-m", "swallow", env=env)
+    assert commit.returncode != 0 and "BLE001" in commit.stdout + commit.stderr, commit.stdout + commit.stderr
+    _write(repo, {"pkg/e.py": "def e():\n    return 5\n"})
+    _git(repo, "add", "--", "pkg/e.py")
+    commit = _sh(repo, "git", "commit", "-q", "-m", "clean", env=env)
+    assert commit.returncode == 0, commit.stdout + commit.stderr
+
+    push = _sh(repo, "git", "push", "-q", "origin", "feature", env=env)
+    assert push.returncode == 0, push.stdout + push.stderr
+    assert _remote_ref(remote, "feature") == _git(repo, "rev-parse", "HEAD")
+    _write(repo, {"pkg/f.py": _SWALLOW})
+    _git(repo, "add", "--", "pkg/f.py")
+    _git(repo, "commit", "-q", "--no-verify", "-m", "swallow")
+    push = _sh(repo, "git", "push", "-q", "origin", "feature", env=env)
+    assert push.returncode != 0 and "BLE001" in push.stdout + push.stderr, push.stdout + push.stderr
+
+
 # --- m4: the CI guards that ran outside the lint workflow --------------------------------------
 
 
@@ -349,8 +387,12 @@ def test_ci_only_guards_run_in_scripts_check(tmp_path, job, files):
     repo = _engine_repo(tmp_path)
     clean = _check(repo, "--staged", "--only", job, "--base", "HEAD")
     assert clean.returncode == 0 and "1 checks, ok" in clean.stdout, clean.stdout + clean.stderr
-    _write(repo, files)
-    _git(repo, "add", "--", *files)
+    # Staged as blobs, never written to disk: a case-insensitive filesystem holds one of
+    # Notes.md / NOTES.md, but the index (what --staged judges) holds both.
+    for rel, text in files.items():
+        blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo, env=_env(),
+                              input=text.encode("utf-8"), capture_output=True, timeout=60, check=True)
+        _git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob.stdout.decode().strip()},{rel}")
     proc = _check(repo, "--staged", "--only", job, "--base", "HEAD")
     assert proc.returncode == 1 and f"FAILED: {job}" in proc.stdout, proc.stdout + proc.stderr
 

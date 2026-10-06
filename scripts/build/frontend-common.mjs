@@ -74,6 +74,24 @@ export function productOutput(source, out, inputs) {
   return { source: src, out: dest }
 }
 
+// Windows refuses to move a tree while anything holds a handle inside it, and
+// an antivirus scanner opens every freshly written exe. Node reports that as
+// EPERM/EACCES/EBUSY; it clears in moments, so ride it out (~3s) rather than
+// throw away a build that took minutes. Other codes never clear by waiting.
+const heldCodes = new Set(['EPERM', 'EACCES', 'EBUSY'])
+const heldRetryDelays = [100, 200, 400, 800, 1600]
+
+export function retryHeld(operation) {
+  for (const delay of [...heldRetryDelays, undefined]) {
+    try {
+      return operation()
+    } catch (error) {
+      if (delay === undefined || !heldCodes.has(error?.code)) throw error
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay)
+    }
+  }
+}
+
 // Never delete the last successful product before a compiler succeeds. The
 // staging and backup directories are siblings so publication stays on one FS.
 function renameProduct(from, to) {
@@ -103,7 +121,7 @@ export function publishDirectory(staged, out, { source } = {}) {
     if (previous) renameProduct(backup, out)
     throw error
   }
-  if (previous) rmSync(backup, { recursive: true, force: true })
+  rmSync(backupRoot, { recursive: true, force: true })
 }
 
 export async function withProduct(out, compile, { source } = {}) {
