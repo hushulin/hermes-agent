@@ -742,6 +742,10 @@ class RestrictedReasoningRunner:
         agent._end_session_on_close = False
         agent._api_max_retries = 1
         agent._disable_streaming = True
+        # The between-turns registry refresh rebuilds agent.tools from the global
+        # tool registry, which holds none of these instance-local schemas: it would
+        # empty the restricted surface (placeholder toolset) before the first send.
+        agent._skip_mcp_refresh = True
         agent._reasoning_runner = self
         agent._memory_manager = _RestrictedManager(self)
         agent.tools = [_schema(n, _FIELDS[n]) for n in TOOL_NAMES]
