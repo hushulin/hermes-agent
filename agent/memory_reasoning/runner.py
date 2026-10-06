@@ -798,6 +798,10 @@ class RestrictedReasoningRunner:
         # tool registry, which holds none of these instance-local schemas: it would
         # empty the restricted surface (placeholder toolset) before the first send.
         agent._skip_mcp_refresh = True
+        # The host approved this route, effort and output cap. Continuation/recovery
+        # heuristics must not silently alter them on the wire: this agent keeps the
+        # approved profile on every request (see _consume_ephemeral_* consumers).
+        agent._preserve_approved_wire = True
         agent._reasoning_runner = self
         agent._memory_manager = _RestrictedManager(self)
         agent.tools = [_schema(n, _FIELDS[n]) for n in TOOL_NAMES]

@@ -1320,6 +1320,11 @@ def _consume_ephemeral_reasoning_off(agent) -> bool:
     consumed = bool(getattr(agent, "_ephemeral_reasoning_off", False))
     if consumed:
         agent._ephemeral_reasoning_off = False
+    if consumed and getattr(agent, "_preserve_approved_wire", False):
+        # Host-approved effort: a thinking-only continuation must still carry the approved
+        # reasoning config on the wire (the restricted runner refuses any request whose
+        # effort is not the approved one), so the one-shot override is dropped here.
+        return False
     return consumed
 
 
@@ -1405,6 +1410,11 @@ def _consume_ephemeral_max_output(agent):
     ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
     if ephemeral_out is not None:
         agent._ephemeral_max_output_tokens = None
+    if getattr(agent, "_preserve_approved_wire", False):
+        # Host-approved output cap: a truncation retry may not exceed it (the restricted
+        # runner requires a physical cap at or below the approved one), so the boosted
+        # one-shot cap is dropped here and the retry re-issues with the same budget.
+        return None
     return ephemeral_out
 
 

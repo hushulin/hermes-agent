@@ -72,10 +72,11 @@ def call(name, args, i=1):
                            function=SimpleNamespace(name=name, arguments=json.dumps(args)))
 
 
-def response(calls=(), content=None):
-    message = SimpleNamespace(content=content, reasoning=None, tool_calls=list(calls))
+def response(calls=(), content=None, reasoning=None, finish_reason=None):
+    message = SimpleNamespace(content=content, reasoning=reasoning, tool_calls=list(calls))
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=message, finish_reason="tool_calls" if calls else "stop")],
+        choices=[SimpleNamespace(message=message,
+                                 finish_reason=finish_reason or ("tool_calls" if calls else "stop"))],
         usage=SimpleNamespace(prompt_tokens=20, completion_tokens=10),
     )
 
@@ -88,11 +89,18 @@ class RecordingTransport:
     def __init__(self, script=()):
         self.script = list(script)
         self.requests = []
+        self.wire_configs = []
+        self.request_keys = []
 
     def supports_effort(self, route):
         return True
 
     def effective_effort(self, request, route):
+        # The synthetic provider emits no real wire reasoning bytes (its model name is not a
+        # reasoning model), so this mirror reports the route's approved effort. The effort
+        # half of the runner's predicate is exercised in production; here the observable
+        # levers core flips on a continuation are the recorded wire reasoning config
+        # (agent._wire_reasoning_config) and the output cap.
         return route.effort
 
     def input_token_upper_bound(self, request, route):
@@ -106,6 +114,8 @@ class RecordingTransport:
 
     def complete(self, request, resolved_agent):
         self.requests.append(request)
+        self.wire_configs.append(getattr(resolved_agent, "_wire_reasoning_config", "<absent>"))
+        self.request_keys.append(sorted(request))
         return self.script.pop(0)
 
 
@@ -251,3 +261,28 @@ def test_compaction_boundary_refresh_honours_the_surface_opt_out(monkeypatch):
 
     assert cc._refresh_agent_tool_definitions(SimpleNamespace(_skip_mcp_refresh=False)) is False
     assert len(calls) == 1, "ordinary agents keep the compaction-boundary refresh"
+
+
+def test_thinking_only_truncation_continuation_keeps_the_approved_wire_profile(fake_route):
+    """P11: a thinking-only truncation continues on the SAME approved effort and cap.
+
+    Core's continuation heuristics drop reasoning (and boost the output cap) when thinking
+    ate the budget; for a host-approved restricted job that would change the approved wire
+    profile, which the runner refuses. The continuation must re-issue identically.
+    """
+    transport = RecordingTransport([
+        response(content=None, reasoning="thinking that consumed the whole cap",
+                 finish_reason="length"),
+        response(content="recovered after the continuation"),
+    ])
+    job = build_runner(script=None, document_read=lambda r, m: Evidence_memory(m),
+                       transport=transport)
+    result = job.run()
+
+    assert result.status != "restricted_failure", result.answer
+    assert result.answer == "recovered after the continuation"
+    assert len(transport.requests) == 2, "the truncated response must be continued, not aborted"
+    approved = {"enabled": True, "effort": job.route.effort}
+    assert transport.wire_configs == [approved, approved], transport.request_keys
+    continuation = transport.requests[1]
+    assert continuation.get("max_tokens") == job.route.max_output_tokens
