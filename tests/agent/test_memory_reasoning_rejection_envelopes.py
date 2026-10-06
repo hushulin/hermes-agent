@@ -311,9 +311,9 @@ def test_rejected_proposal_attempt_earns_one_bounded_correction(fake_route):
     assert len(transport.requests) >= 4, "the rejected attempt must not end the run"
 
 
-def test_host_submit_failure_keeps_the_host_reason_code(fake_route):
-    """P15: the host's own failure code survives instead of collapsing to
-    'host_submit_failed:ValueError', which made the live 20:33 stop undiagnosable."""
+def test_unrecoverable_submit_failure_keeps_the_host_reason_code_and_aborts(fake_route):
+    """P15/P17 invariant: a submit failure that is NOT a proposal-shape rejection still keeps
+    the host's code and still ends the round (the recoverable family is listed in the runner)."""
     import dataclasses
     from agent.memory_reasoning import runner as runner_mod
 
@@ -323,7 +323,7 @@ def test_host_submit_failure_keeps_the_host_reason_code(fake_route):
     assert runner_mod._host_submit_detail(RuntimeError('bad\nsecond line')) == 'bad'
 
     def refuse(submission):
-        raise ValueError('STRUCTURED_PROPOSAL_ITEM_SCHEMA_INVALID')
+        raise ValueError('read_budget_exhausted')
 
     submission = {"action": "UPDATE", "evidence_refs": ["memory:1"]}
     transport = RecordingTransport([
@@ -336,9 +336,55 @@ def test_host_submit_failure_keeps_the_host_reason_code(fake_route):
     job.handlers = dataclasses.replace(job.handlers, submit_proposal=refuse)
     result = job.run()
 
-    assert job._stop_reason == 'host_submit_failed:STRUCTURED_PROPOSAL_ITEM_SCHEMA_INVALID'
+    assert job._stop_reason == 'host_submit_failed:read_budget_exhausted'
     assert result.status == "restricted_failure", result.status
-    assert "STRUCTURED_PROPOSAL_ITEM_SCHEMA_INVALID" in result.answer, result.answer
+    assert "read_budget_exhausted" in result.answer, result.answer
+
+
+def test_structured_proposal_shape_rejection_returns_the_host_reason_and_continues(fake_route):
+    """P17: a host rejection of the proposal's SHAPE does not end the round — the model gets the
+    host's own code back and may resubmit inside the existing budgets (P8/P14 family)."""
+    import dataclasses
+    from agent.memory_reasoning import runner as runner_mod
+    seen = []
+
+    # Only the STRUCTURED_PROPOSAL_* family is a recoverable shape slip; every other host
+    # rejection (budget, source, planning) stays a hard stop.
+    assert runner_mod._proposal_shape_rejection('STRUCTURED_PROPOSAL_ITEM_INVALID')
+    assert runner_mod._proposal_shape_rejection('STRUCTURED_PROPOSAL_REFS_OR_ITEMS_INVALID')
+    assert not runner_mod._proposal_shape_rejection('read_budget_exhausted')
+    assert not runner_mod._proposal_shape_rejection('PLANNING_DUPLICATE_EVIDENCE')
+    assert not runner_mod._proposal_shape_rejection('TASK_SOURCE_INVALID')
+
+    def refuse_then_accept(submission):
+        seen.append(submission.proposal_json)
+        if len(seen) == 1:
+            raise ValueError('STRUCTURED_PROPOSAL_REFS_OR_ITEMS_INVALID')
+        return 'receipt:shape-fixed'
+
+    bad = {"action": "UPDATE", "evidence_refs": ["memory:1"], "note": "wrong shape"}
+    good = {"action": "UPDATE", "evidence_refs": ["memory:1"]}
+    transport = RecordingTransport([
+        response([call("reason_memory_search", {"query": "project database"})]),
+        response([call("reason_proposal_submit", {"proposal": bad})]),
+        response([call("reason_proposal_submit", {"proposal": good})]),
+        response(content="done"),
+    ])
+    job = build_runner(script=None, document_read=lambda r, m: Evidence_memory(m),
+                       transport=transport)
+    job.handlers = dataclasses.replace(job.handlers, submit_proposal=refuse_then_accept)
+    result = job.run()
+
+    assert job._stop_reason is None, job._stop_reason
+    assert result.status == "proposal_submitted", (result.status, result.answer)
+    assert result.proposal_receipt == 'receipt:shape-fixed'
+    # The corrected JSON reached the host, which is only possible if the frozen submission was
+    # rolled back (otherwise the host answers a different revision with a conflict).
+    assert len(seen) == 2, seen
+    assert seen[0] != seen[1]
+    # The model saw the host's own code in the tool result of the rejected submission.
+    assert 'STRUCTURED_PROPOSAL_REFS_OR_ITEMS_INVALID' in json.dumps(
+        transport.requests[-1], ensure_ascii=False)
 
 
 def test_thinking_only_truncation_continuation_keeps_the_approved_wire_profile(fake_route):

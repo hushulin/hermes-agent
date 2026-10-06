@@ -50,6 +50,27 @@ def _host_submit_detail(exc: Exception) -> str:
     return keep or type(exc).__name__
 
 
+# Host rejections that mean "the proposal's own shape/content is not usable". Every one of them
+# is produced by the host's parse of the submitted JSON, so a corrected resubmission can
+# succeed: they are recovered like a malformed tool call (P8) with one bounded correction
+# (P14). Everything else the host raises stays a hard stop.
+_PROPOSAL_SHAPE_REJECTIONS = frozenset({
+    "STRUCTURED_PROPOSAL_SCHEMA_INVALID",
+    "STRUCTURED_PROPOSAL_REFS_OR_ITEMS_INVALID",
+    "STRUCTURED_PROPOSAL_ITEM_SCHEMA_INVALID",
+    "STRUCTURED_PROPOSAL_FORGET_KIND_INVALID",
+    "STRUCTURED_PROPOSAL_ITEM_INVALID",
+    "STRUCTURED_PROPOSAL_ENUM_INVALID",
+    "STRUCTURED_PROPOSAL_TARGET_REQUIRED",
+    "STRUCTURED_PROPOSAL_TARGET_NOT_REFERENCED",
+})
+_PROPOSAL_SHAPE_EXPECTED = "proposal.items and proposal.evidence_refs per the host proposal schema"
+
+
+def _proposal_shape_rejection(detail: str) -> bool:
+    return detail.split(":", 1)[0].strip() in _PROPOSAL_SHAPE_REJECTIONS
+
+
 def _positive_int(value: Any) -> bool:
     return type(value) is int and value > 0
 
@@ -774,11 +795,24 @@ class RestrictedReasoningRunner:
         try:
             receipt = self.handlers.submit_proposal(submission)
         except Exception as exc:
+            detail = _host_submit_detail(exc)
+            if _proposal_shape_rejection(detail):
+                # The host rejected only the proposal's SHAPE and persisted nothing, so this is
+                # recoverable: roll the frozen submission back (otherwise the corrected JSON
+                # would be answered with a revision conflict), hand the host's own reason to the
+                # model like a malformed call (P8), and let it fix the JSON. The call already
+                # charged its logical tool, and marking the attempt lets the no-progress guard
+                # give exactly one more send (P14) — the existing budgets still bound it.
+                logger.warning("host rejected the proposal shape: %s", detail)
+                self._proposal_submission = None
+                self._proposal_state = None
+                self._last_send_rejected_proposal = True
+                return json.dumps({"status": "rejected", "reason": detail,
+                                   "expected": _PROPOSAL_SHAPE_EXPECTED})
             # Keep the host's own reason code. The plugin raises stable, actionable ValueError
             # codes (e.g. 'read_budget_exhausted', 'STRUCTURED_PROPOSAL_ITEM_SCHEMA_INVALID');
             # collapsing every one of them into the exception TYPE made the failure
             # undiagnosable from the journal and turned a shaping slip into an opaque stop.
-            detail = _host_submit_detail(exc)
             logger.warning("host proposal submission failed: %s (%s)", detail, type(exc).__name__)
             self._stop_reason = "host_submit_failed:" + detail
             raise RuntimeError("host_submit_failed:" + detail) from None
