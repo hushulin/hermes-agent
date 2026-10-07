@@ -93,34 +93,35 @@ export function retryHeld(operation) {
 }
 
 // Never delete the last successful product before a compiler succeeds. The
-// backup lives beside out, outside withProduct's scratch tree, so a failed
-// rollback leaves the previous product somewhere a person can recover it.
+// staging and backup directories are siblings so publication stays on one FS.
+function renameProduct(from, to) {
+  const wait = new Int32Array(new SharedArrayBuffer(4))
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(from, to)
+      return
+    } catch (error) {
+      // Windows scanners may briefly hold freshly written build artifacts.
+      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt >= 200) throw error
+      Atomics.wait(wait, 0, 0, 100)
+    }
+  }
+}
+
 export function publishDirectory(staged, out, { source } = {}) {
   // The destination may have been occupied while the compiler was running.
   requireOwnedOutput(out, source)
   writeFileSync(path.join(staged, productMarker), productOwner)
-  if (!existsSync(out)) return retryHeld(() => renameSync(staged, out))
-  const backupRoot = mkdtempSync(path.join(path.dirname(out), `.${path.basename(out)}-previous-`))
-  const backup = path.join(backupRoot, 'product')
+  const backup = `${staged}.previous`
+  const previous = existsSync(out)
+  if (previous) renameProduct(out, backup)
   try {
-    retryHeld(() => renameSync(out, backup))
+    renameProduct(staged, out)
   } catch (error) {
-    rmSync(backupRoot, { recursive: true, force: true })
+    if (previous) renameProduct(backup, out)
     throw error
   }
-  try {
-    retryHeld(() => renameSync(staged, out))
-  } catch (error) {
-    try {
-      retryHeld(() => renameSync(backup, out))
-    } catch (rollbackError) {
-      error.message += `; rollback failed (${rollbackError.message}); previous product kept at ${backup}`
-      throw error
-    }
-    rmSync(backupRoot, { recursive: true, force: true })
-    throw error
-  }
-  rmSync(backupRoot, { recursive: true, force: true })
+  if (previous) rmSync(backup, { recursive: true, force: true })
 }
 
 export async function withProduct(out, compile, { source } = {}) {
