@@ -3690,37 +3690,6 @@ def _iter_pool_sockets(client: Any):
                     yield sock
 
 
-def _socket_is_dead(sock) -> bool:
-    """Probe socket health with a non-blocking recv peek."""
-    import socket as _socket
-    try:
-        sock.setblocking(False)
-        return sock.recv(1, _socket.MSG_PEEK | _socket.MSG_DONTWAIT) == b""
-    except BlockingIOError:
-        return False  # no data available: socket is healthy
-    except OSError:
-        return True
-    finally:
-        with contextlib.suppress(OSError):
-            sock.setblocking(True)
-
-
-def cleanup_dead_connections(agent) -> bool:
-    """Force-close and rebuild the primary client if its pool has dead sockets (CLOSE-WAIT, errors); returns True if cleaned."""
-    client = getattr(agent, "client", None)
-    if client is None:
-        return False
-    try:
-        dead_count = sum(1 for sock in _iter_pool_sockets(client) if _socket_is_dead(sock))
-        if dead_count > 0:
-            _ra().logger.warning("Found %d dead connection(s) in client pool — rebuilding client", dead_count)
-            agent._replace_primary_openai_client(reason="dead_connection_cleanup")
-            return True
-    except Exception as exc:
-        _ra().logger.debug("Dead connection check error: %s", exc)
-    return False
-
-
 def _set_reset_from_retry_after(context: Dict[str, Any], retry_after: Any) -> None:
     if "reset_at" in context:
         return
@@ -3903,7 +3872,7 @@ __all__ = [
     "dump_api_request_debug", "prompt_caching_disabled_from_config", "blank_cache_policy_stub",
     "plan_cache_sections_for_destination", "anthropic_prompt_cache_policy", "create_openai_client",
     "switch_model", "invoke_tool", "repair_tool_call", "sanitize_api_messages",
-    "looks_like_codex_intermediate_ack", "copy_reasoning_content_for_api", "cleanup_dead_connections",
+    "looks_like_codex_intermediate_ack", "copy_reasoning_content_for_api",
     "extract_api_error_context", "apply_pending_steer_to_tool_results", "_iter_pool_sockets",
     "force_close_tcp_sockets",
 ]
