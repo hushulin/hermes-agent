@@ -589,7 +589,7 @@ class MemoryManager:
 
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "",
                  messages: Optional[List[Dict[str, Any]]] = None,
-                 turn_author: Optional[Dict[str, Any]] = None) -> None:
+                 turn_author: Optional[Dict[str, Any]] = None, current_source=None) -> None:
         """Sync a completed turn to all providers on the background worker.
 
         Never inline: a provider's ``sync_turn`` may block for minutes, which kept ``run_conversation``
@@ -606,7 +606,8 @@ class MemoryManager:
             return
         clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
             clean_user_content, assistant_content, messages)
-        optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author}
+        optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author,
+                           "current_source": current_source}
 
         def _sync(provider: MemoryProvider) -> None:
             kwargs: Dict[str, Any] = {"session_id": session_id}

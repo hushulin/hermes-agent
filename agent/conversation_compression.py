@@ -162,6 +162,10 @@ def is_compaction_progress_status(text: str | None) -> bool:
 def _refresh_agent_tool_definitions(agent) -> bool:
     """Rebuild agent.tools at the compaction commit boundary (the only moment config reaches a forever-session's
     frozen tool schemas; the prompt cache is already invalid). Returns True when tools were added."""
+    if getattr(agent, "_skip_mcp_refresh", False):
+        # Same instance-local surface opt-out the between-turns hook honours: a restricted
+        # agent's schemas are never registered, so a registry rebuild would empty them.
+        return False
     from tools.mcp_tool_agent import refresh_agent_mcp_tools
     added = refresh_agent_mcp_tools(agent, content_aware=True)
     if added:
