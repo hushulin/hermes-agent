@@ -127,7 +127,6 @@ import {
 } from './bundle-swap'
 import { CHALLENGE_PARTITION } from './challenge-window'
 import { registerChallengeWindowIpc } from './challenge-window-ipc'
-import { registerChatOnboardingWindow } from './chat-onboarding-window'
 import { provisionCliLinks } from './cli-provision'
 import { closeStopFailureMessage, finishWindowsCloseStop, type RuntimeLock } from './close-stop-kill'
 import { shouldAttemptCloudBootCascade } from './cloud-boot-cascade'
@@ -615,7 +614,12 @@ import {
   registerUpdateHoldIpc,
   waitForPoolUpdateClearance
 } from './update-hold-wiring'
-import { describeSkippedPrewrite, readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
+import {
+  describeSkippedPrewrite,
+  readLiveUpdateMarker,
+  updateHandoffConflict,
+  writeUpdateMarker
+} from './update-marker'
 import { heldWaitMessage, holdTicker } from './update-marker-gate'
 import { updateConnectionsBeforeLocal } from './update-order'
 import {
@@ -652,7 +656,7 @@ import {
   registerUpdateRelaunch,
   type RelaunchRegistration
 } from './updater/relaunch'
-import { relaunchWaiterScript, startRelaunchWaiter } from './updater/relaunch-waiter'
+import { startUpdateRelaunchWaiter } from './updater/relaunch-waiter'
 import { preflightStateDb } from './updater/state-db-preflight'
 import { createStoreStrategy } from './updater/store-client'
 import { isExternalVenvHolder, isHermesOwnedVenvDaemon } from './venv-holder-select'
@@ -670,6 +674,7 @@ import {
 } from './window-connection-route'
 import { registerWindowControlIpc, windowControlState } from './window-controls'
 import { revealAction, shouldFocusToTakeKeyboard } from './window-focus-policy'
+import { isAppSized, registerWindowSizing } from './window-growth'
 import { windowMenuTemplate } from './window-menu'
 import { createWindowOpenHandler } from './window-open-policy'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
@@ -678,10 +683,10 @@ import {
   bindGeometryPersistence,
   computeWindowOptions,
   debounce,
-  firstLaunchSize,
   sanitizeWindowState,
   MIN_HEIGHT as WINDOW_MIN_HEIGHT,
-  MIN_WIDTH as WINDOW_MIN_WIDTH
+  MIN_WIDTH as WINDOW_MIN_WIDTH,
+  windowSize
 } from './window-state'
 import { hiddenWindowsChildOptions, windowsShellCommand } from './windows-child-options'
 import { buildPathExtCandidates, chooseUpdaterArgs, resolveVenvHermesCommand } from './windows-hermes-path'
@@ -3633,7 +3638,7 @@ function readWindowState() {
 // broken transition behind #94319 — so record that provenance and let recovery
 // on the next launch recognize the snapshot instead of guessing from geometry.
 function persistWindowState() {
-  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized()) {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized() || isAppSized(mainWindow)) {
     return
   }
 
@@ -3851,12 +3856,7 @@ function createNativePackagedStrategy(
           // script is staged to a temp dir and resolved absolutely so
           // nothing inherited from the package holds the swap open.
           relaunch: () =>
-            startRelaunchWaiter({
-              processId: process.pid,
-              processStartTimeMs: Math.round(Date.now() - process.uptime() * 1000),
-              identityName: PRODUCT_IDENTITY.msixAppIdWithOrg,
-              scriptPath: relaunchWaiterScript(process.resourcesPath)
-            })
+            startUpdateRelaunchWaiter(PRODUCT_IDENTITY.msixAppIdWithOrg, process.resourcesPath, rememberLog)
         })
     }
 
@@ -3882,13 +3882,12 @@ function createNativePackagedStrategy(
       registerPendingRelaunch: (fromVersion: string): Promise<RelaunchRegistration> =>
         registerUpdateRelaunch(app, fromVersion, {
           relaunch: () =>
-            startRelaunchWaiter({
-              processId: process.pid,
-              processStartTimeMs: Math.round(Date.now() - process.uptime() * 1000),
-              identityName: PRODUCT_IDENTITY.storeMsix!.identityName,
-              scriptPath: relaunchWaiterScript(process.resourcesPath),
-              timeoutSeconds: 1860
-            })
+            startUpdateRelaunchWaiter(
+              PRODUCT_IDENTITY.storeMsix!.identityName,
+              process.resourcesPath,
+              rememberLog,
+              1860
+            )
         })
     })
   }
@@ -13948,7 +13947,7 @@ function nextInstanceBounds(source: BrowserWindow | null = BrowserWindow.getFocu
   const displays = screen.getAllDisplays()
 
   const fallback = computeWindowOptions(
-    readWindowState() ?? firstLaunchSize(screen.getPrimaryDisplay().workArea),
+    readWindowState() ?? windowSize('normal', screen.getPrimaryDisplay().workArea),
     displays
   )
 
@@ -14055,7 +14054,7 @@ const wakeIndicatorController = createWakeIndicatorWindowController({
   wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator'))
 })
 
-registerChatOnboardingWindow({ enabled: GUEST_ONBOARDING, mainWindow: (): BrowserWindow | null => mainWindow })
+registerWindowSizing({ enabled: GUEST_ONBOARDING, mainWindow: (): BrowserWindow | null => mainWindow })
 registerMachineProfile()
 
 // The pet overlay: a single transparent, frameless, always-on-top window that
@@ -15059,7 +15058,7 @@ function createWindow() {
   const savedWindowState = readWindowState()
   mainWindow = new BrowserWindow({
     ...computeWindowOptions(
-      savedWindowState ?? firstLaunchSize(screen.getPrimaryDisplay().workArea),
+      savedWindowState ?? windowSize('normal', screen.getPrimaryDisplay().workArea),
       screen.getAllDisplays()
     ),
     minWidth: WINDOW_MIN_WIDTH,
