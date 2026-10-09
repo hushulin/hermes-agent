@@ -271,6 +271,15 @@ def admit_platform_text(event, adapter, home, session_key):
     return bundle
 
 
+def _cli_session_key(session_id, session_key):
+    """CLI has no platform key; use its validated session id without rewriting signed rows."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if session_key is None or session_key == "":
+        return session_id
+    return session_key if isinstance(session_key, str) else None
+
+
 def mint_local_input(raw, *, home, session_id, extraction=None):
     """Call only at the original local CLI caller boundary, never inside AIAgent."""
     if (not isinstance(raw, str) or not raw.strip() or not isinstance(session_id, str)
@@ -998,19 +1007,26 @@ def _project_local_control_source(conn, db_path, session_id, row_id, receipt):
         return None
     row = conn.execute("SELECT role,content,platform_message_id FROM messages "
                        "WHERE id=? AND session_id=?", (row_id, session_id)).fetchone()
-    session = conn.execute("SELECT source FROM sessions WHERE id=?", (session_id,)).fetchone()
+    session = conn.execute("SELECT source,session_key FROM sessions WHERE id=?", (session_id,)).fetchone()
     if (row is None or session is None or session["source"] != "cli" or row["role"] != "user"
             or not isinstance(row["content"], str) or not row["content"]
             or row["platform_message_id"] is not None):
         return None
+    session_key = _cli_session_key(session_id, session["session_key"])
+    if (session_key is None or receipt.session_key is not None
+            and _cli_session_key(session_id, receipt.session_key) != session_key):
+        return None
     source_id = _digest(json.dumps([home, receipt.namespace, receipt.occurrence, receipt.revision,
                                     "maintenance"], separators=(",", ":"), ensure_ascii=True))
-    source = conn.execute("SELECT raw_digest,actor,home FROM maintenance_sources_v1 WHERE source_id=?",
+    source = conn.execute("SELECT raw_digest,actor,home,session_id,session_key "
+                          "FROM maintenance_sources_v1 WHERE source_id=?",
                           (source_id,)).fetchone()
     controls = conn.execute(
         "SELECT control_kind,control_binding_json,control_digest "
         "FROM maintenance_local_controls_v1 WHERE source_id=?", (source_id,)).fetchone()
     if (source is None or controls is None
+            or source["session_id"] != session_id
+            or _cli_session_key(source["session_id"], source["session_key"]) != session_key
             or (source["raw_digest"], source["actor"], source["home"]) != (
                 _digest(receipt.raw), receipt.actor, home)
             or not _local_control_row_matches(source_id, controls["control_kind"],
@@ -1062,7 +1078,8 @@ def _bind_one_source(conn, db_path, session_id, row_id, receipt, *,
                                    separators=(",", ":"), ensure_ascii=True))
     existing_table = conn.execute("SELECT 1 FROM sqlite_master WHERE name='maintenance_sources_v1'").fetchone()
     if existing_table:
-        existing = conn.execute("SELECT raw_digest,actor,home FROM maintenance_sources_v1 WHERE source_id=?",
+        existing = conn.execute("SELECT raw_digest,actor,home,session_id,session_key "
+                                "FROM maintenance_sources_v1 WHERE source_id=?",
                                 (source_id,)).fetchone()
         if existing is not None:
             if (existing["raw_digest"], existing["actor"], existing["home"]) != (
@@ -1074,7 +1091,15 @@ def _bind_one_source(conn, db_path, session_id, row_id, receipt, *,
                                                      display_text, require_row=False)):
                     return None
             else:
-                if session["source"] != platform or row["platform_message_id"] != (batch_anchor or receipt.event_id):
+                # A transcript clone retains the original owner's identity, not the clone's key.
+                if (session["source"] != platform
+                        or row["platform_message_id"] != (batch_anchor or receipt.event_id)
+                        or receipt.authority == "cli-local" and (
+                            receipt.intended_session_id != existing["session_id"]
+                            or receipt.namespace != "cli/local" or receipt.actor != "local-user"
+                            or receipt.session_key is not None and
+                            _cli_session_key(receipt.intended_session_id, receipt.session_key) !=
+                            _cli_session_key(existing["session_id"], existing["session_key"]))):
                     return None
                 if receipt.authority == "feishu-human":
                     original = conn.execute(
@@ -1088,8 +1113,13 @@ def _bind_one_source(conn, db_path, session_id, row_id, receipt, *,
             conn.execute("INSERT OR IGNORE INTO maintenance_source_projections_v1 VALUES (?,?,?)",
                          (source_id, session_id, row_id))
             return source_id  # A transcript clone references the original authority.
-    if (receipt.session_key is not None and session["session_key"] != receipt.session_key
+    session_key = (_cli_session_key(session_id, session["session_key"])
+                   if receipt.authority == "cli-local" else session["session_key"])
+    receipt_key = (_cli_session_key(receipt.intended_session_id, receipt.session_key)
+                   if receipt.authority == "cli-local" else receipt.session_key)
+    if (receipt.session_key is not None and session_key != receipt_key
             or receipt.authority == "cli-local" and (session["source"] != "cli"
+                or session_key is None
                 or receipt.namespace != "cli/local" or receipt.actor != "local-user"
                 or receipt.intended_session_id != session_id or row["platform_message_id"] is not None)
             or receipt.authority == "feishu-human" and not is_platform_event and (
@@ -1138,7 +1168,7 @@ def _bind_one_source(conn, db_path, session_id, row_id, receipt, *,
         (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
         (source_id, receipt.authority, receipt.origin, home, receipt.namespace, receipt.actor,
          receipt.audience, receipt.occurrence, receipt.event_id, receipt.revision, session_id,
-         session["session_key"], row_id, receipt.source_time, receipt.received_time, receipt.timezone,
+         session_key, row_id, receipt.source_time, receipt.received_time, receipt.timezone,
          int(receipt.time_fallback), receipt.raw_ref,
          sqlite3.Binary(receipt.raw.encode("utf-8", "surrogatepass")),
          _digest(receipt.raw), receipt.extraction, ""))
@@ -1195,12 +1225,22 @@ def commit_local_control_source(profile_home, session_id, receipt):
         if session is None or session["source"] != "cli":
             db.rollback()
             return None
+        session_key = _cli_session_key(session_id, session["session_key"])
+        if (session_key is None or receipt.session_key is not None
+                and _cli_session_key(session_id, receipt.session_key) != session_key):
+            db.rollback()
+            return None
         has_sources = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='maintenance_sources_v1'").fetchone()
         if has_sources:
-            existing = db.execute("SELECT raw_digest,actor,home FROM maintenance_sources_v1 WHERE source_id=?",
+            existing = db.execute("SELECT raw_digest,actor,home,session_id,session_key "
+                                  "FROM maintenance_sources_v1 WHERE source_id=?",
                                   (source_id,)).fetchone()
             if existing is not None:
+                if (existing["session_id"] != session_id or
+                        _cli_session_key(existing["session_id"], existing["session_key"]) != session_key):
+                    db.rollback()
+                    return None
                 if (existing["raw_digest"], existing["actor"], existing["home"]) != (
                         _digest(receipt.raw), receipt.actor, str(home)):
                     db.rollback()
@@ -1238,7 +1278,7 @@ def commit_local_control_source(profile_home, session_id, receipt):
             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
             (source_id, receipt.authority, receipt.origin, str(home), receipt.namespace, receipt.actor,
              receipt.audience, receipt.occurrence, receipt.event_id, receipt.revision, session_id,
-             session["session_key"] or session_id, 0, receipt.source_time, receipt.received_time,
+             session_key, 0, receipt.source_time, receipt.received_time,
              receipt.timezone, int(receipt.time_fallback), receipt.raw_ref,
              sqlite3.Binary(receipt.raw.encode("utf-8", "surrogatepass")),
              _digest(receipt.raw), receipt.extraction, ""))
@@ -1357,6 +1397,12 @@ def read_committed_source(profile_home, source_id):
                 (source["session_id"],)).fetchone()
             platform = {"cli-local": "cli", "feishu-human": "feishu",
                         "qqbot-human": "qqbot", "weixin-human": "weixin"}.get(source["authority"])
+            # Compare canonical CLI identities, but return the original signed fields unchanged.
+            session_key = session["session_key"] if session is not None else None
+            source_key = source["session_key"]
+            if platform == "cli":
+                session_key = _cli_session_key(source["session_id"], session_key)
+                source_key = _cli_session_key(source["session_id"], source_key)
             has_batches = db.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='maintenance_source_batches_v1'").fetchone()
             batch = (db.execute("SELECT anchor_event_id,display_digest,position,size "
@@ -1381,7 +1427,7 @@ def read_committed_source(profile_home, source_id):
                         or source["event_id"] is not None or source["raw_ref"] is not None
                         or source["message_row_id"] != 0 or session is None
                         or session["source"] != "cli"
-                        or str(session["session_key"] or "") != str(source["session_key"] or "")
+                        or session_key is None or session_key != source_key
                         or not _local_control_row_matches(source_id, kind,
                                                           local_control["control_binding_json"],
                                                           local_control["control_digest"])):
@@ -1457,7 +1503,7 @@ def read_committed_source(profile_home, source_id):
                         "batch_position": batch["position"] if batch is not None else 0,
                         "batch_size": batch["size"] if batch is not None else 1}
             row_event_id = batch[0] if batch else source["event_id"]
-            if (session is None or session["session_key"] != source["session_key"]
+            if (session is None or session_key is None or session_key != source_key
                     or source["origin"] != "human" or platform is None
                     or session["source"] != platform
                     or source["audience"] not in ("private", "group")
@@ -1574,7 +1620,8 @@ def rehydrate_source_receipt(profile_home, source_id):
             event_id=None, revision=source["revision"], source_time=source["source_time"],
             received_time=source["received_time"], timezone=source["timezone"],
             time_fallback=bool(source["time_fallback"]), raw_ref=None, home=source["home"],
-            session_key=source["session_key"], intended_session_id=source["session_id"],
+            session_key=_cli_session_key(source["session_id"], source["session_key"]),
+            intended_session_id=source["session_id"],
             seal=_SEAL, display=source["extraction_text"], contract=CONTRACT)
     if source["schema"] == CLI_CONTROL_CONTRACT:
         if (source["authority"] != "cli-local" or source["event_id"] is not None
@@ -1587,7 +1634,8 @@ def rehydrate_source_receipt(profile_home, source_id):
             event_id=None, revision=source["revision"], source_time=source["source_time"],
             received_time=source["received_time"], timezone=source["timezone"],
             time_fallback=bool(source["time_fallback"]), raw_ref=None, home=source["home"],
-            session_key=source["session_key"], intended_session_id=source["session_id"],
+            session_key=_cli_session_key(source["session_id"], source["session_key"]),
+            intended_session_id=source["session_id"],
             seal=_SEAL, display=source["extraction_text"], contract=CLI_CONTROL_CONTRACT,
             input_kind=source.get("control_kind"), control_kind=source.get("control_kind"),
             control_binding_json=source.get("control_binding_json"))
