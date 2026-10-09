@@ -134,10 +134,9 @@ jobs:
 
   e2e:
     # Fork policy: Linux-only suite excluded here (see the `test` job note).
-    if: ${{ github.repository != 'hushulin/hermes-agent' }}
+    if: ${{ github.repository != 'hushulin/hermes-agent' && inputs.e2e }}
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
-    if: inputs.e2e
     runs-on: ubuntu-latest-32-core
     timeout-minutes: 30
     steps:
@@ -220,14 +219,13 @@ jobs:
 
   e2e-upgrade-plan:
     # Fork policy: Linux-only suite excluded here (see the `test` job note).
-    if: ${{ github.repository != 'hushulin/hermes-agent' }}
+    if: ${{ github.repository != 'hushulin/hermes-agent' && inputs.e2e_upgrade }}
     # One e2e-upgrade shard per suite directory: the files directly under
     # tests/e2e/core/upgrade ("core") plus every subdirectory that holds
     # test_*.py (pm, git, handoff, network, hosts, ...). A new suite
     # directory gets its own shard without editing this file, and no shard
     # carries the whole tree's wall time against the 60-minute timeout.
     # Skipping this job skips every e2e-upgrade shard with it.
-    if: inputs.e2e_upgrade
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
