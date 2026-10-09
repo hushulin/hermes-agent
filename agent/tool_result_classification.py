@@ -41,6 +41,18 @@ def is_guardrail_refusal(result: Any) -> bool:
     return isinstance(data, dict) and data.get(GUARDRAIL_REFUSAL_KEY) is True
 
 
+def structured_tool_result_failed(data: Any) -> bool:
+    """Only the result envelope can report failure, not nested/history payloads."""
+    if not isinstance(data, dict):
+        return False
+    status = data.get("status")
+    # Some tools use bare success:false as a benign outcome. Preserve the
+    # existing requirement for a message before treating that flag as failure.
+    return bool(data.get("error")) or (data.get("success") is False and bool(data.get("message"))) or (
+        isinstance(status, str) and status.lower() in {"error", "failed"}
+    )
+
+
 def file_mutation_result_landed(tool_name: str, result: Any) -> bool:
     """Return True when a file mutation result proves the write landed."""
     if tool_name not in FILE_MUTATING_TOOL_NAMES or not isinstance(result, str):

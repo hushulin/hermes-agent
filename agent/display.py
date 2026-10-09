@@ -18,7 +18,11 @@ from urllib.parse import urlsplit
 from utils import safe_json_loads
 from agent.i18n import t
 from agent.redact import redact_sensitive_text
-from agent.tool_result_classification import file_mutation_result_landed, is_guardrail_refusal
+from agent.tool_result_classification import (
+    file_mutation_result_landed,
+    is_guardrail_refusal,
+    structured_tool_result_failed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1000,7 +1004,8 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
     """Return ``(is_failure, suffix)`` for a tool result, e.g. ``(True, " [exit 1]")``."""
     if result is None or file_mutation_result_landed(tool_name, result):
         return False, ""
-    data = result if isinstance(result, dict) else safe_json_loads(result)
+    unparsed = object()
+    data = safe_json_loads(result, default=unparsed) if isinstance(result, str) else result
     # A harness REFUSAL of a redundant call (repeated identical read/search) is not a
     # failed call. This is the ``failed`` the executor hands the loop guardrail, so
     # counting it would escalate refusals into ``repeated_exact_failure_block``.
@@ -1025,13 +1030,14 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
     if isinstance(data, dict):
         failed = data.get("success") is False
         # Memory: distinguish "store full" from real errors.
-        if tool_name == "memory" and failed and "exceed the limit" in data.get("error", ""):
+        if tool_name == "memory" and failed and "exceed the limit" in str(data.get("error") or ""):
             return True, t("display.failure.memory_full")
         err = data.get("error") or data.get("message")
-        if err and (failed or "error" in data):
-            return True, f" [{_trim_error(str(err))}]"
-    # Multimodal results (dicts) are successes; failures arrive as JSON-encoded strings.
-    if isinstance(result, str) and (
+        if structured_tool_result_failed(data):
+            return True, f" [{_trim_error(str(err))}]" if err else t("display.failure.generic")
+    # Parsed JSON is authoritative. Historical/nested errors are business data;
+    # only malformed or plain-text responses need the legacy substring heuristic.
+    if data is unparsed and (
         '"error"' in result[:500].lower() or '"failed"' in result[:500].lower() or result.startswith("Error")
     ):
         return True, t("display.failure.generic")
