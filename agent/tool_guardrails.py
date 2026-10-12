@@ -14,7 +14,11 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
 
 from utils import safe_json_loads
-from agent.tool_result_classification import file_mutation_result_landed, is_guardrail_refusal
+from agent.tool_result_classification import (
+    file_mutation_result_landed,
+    is_guardrail_refusal,
+    structured_tool_result_failed,
+)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset({
@@ -215,28 +219,32 @@ def canonical_tool_args(args: Mapping[str, Any]) -> str:
     return _canonical_json(args)
 
 
-def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
+def classify_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
     """Fallback classifier used only when callers don't pass ``failed``; mirrors
     ``agent.display._detect_tool_failure`` so the guardrail never disagrees with the CLI's ``[error]`` tag."""
     if result is None or file_mutation_result_landed(tool_name, result):
         return False, ""
+    unparsed = object()
+    data = safe_json_loads(result, default=unparsed) if isinstance(result, str) else result
 
     # A harness REFUSAL of a redundant call (repeated identical read/search) carries
     # ``"error"`` for the model's benefit -- exactly what the substring test below keys
     # on -- but nothing failed; counting it lets the cheap refusal feed the streak that
     # fires the next, harder one. Mirrored in ``agent.display._detect_tool_failure``.
-    if is_guardrail_refusal(result):
+    if is_guardrail_refusal(data):
         return False, ""
+    if isinstance(data, dict) and data.get("user_summary"):
+        return True, " [error]"
 
     if tool_name == "terminal":
-        data = safe_json_loads(result)
         exit_code = data.get("exit_code") if isinstance(data, dict) else None
         return (True, f" [exit {exit_code}]") if exit_code is not None and exit_code != 0 else (False, "")
 
     if tool_name == "memory":
-        data = safe_json_loads(result)
-        if isinstance(data, dict) and data.get("success") is False and "exceed the limit" in data.get("error", ""):
+        if isinstance(data, dict) and data.get("success") is False and "exceed the limit" in str(data.get("error") or ""):
             return True, " [full]"
+    if data is not unparsed:
+        return (True, " [error]") if structured_tool_result_failed(data) else (False, "")
     lower = result[:500].lower()
     return (True, " [error]") if '"error"' in lower or '"failed"' in lower or result.startswith("Error") else (False, "")
 
