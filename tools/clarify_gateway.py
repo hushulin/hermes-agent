@@ -23,7 +23,7 @@ class _ClarifyEntry:
     clarify_id: str
     session_key: str
     question: str
-    choices: Optional[List[str]]
+    choices: Optional[list[str]]
     multi_select: bool = False
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
@@ -33,10 +33,10 @@ class _ClarifyEntry:
 
 
 _lock = threading.RLock()
-_entries: Dict[str, _ClarifyEntry] = {}  # clarify_id -> entry (button callbacks)
-_session_index: Dict[str, List[str]] = {}  # session_key -> [clarify_id] FIFO (text intercept, cleanup)
+_entries: dict[str, _ClarifyEntry] = {}  # clarify_id -> entry (button callbacks)
+_session_index: dict[str, list[str]] = {}  # session_key -> [clarify_id] FIFO (text intercept, cleanup)
 # Per-session notify callbacks (gateway -> adapter bridge); mirrors tools.approval. Tests clear it.
-_notify_cbs: Dict[str, Callable[[_ClarifyEntry], None]] = {}
+_notify_cbs: dict[str, Callable[[_ClarifyEntry], None]] = {}
 
 # Outcomes for typed clarify replies. Gateway cancels the pending prompt on
 # free prose (deadlock break) but keeps it armed for a retryable bad selection.
@@ -171,7 +171,7 @@ def get_pending_for_session(session_key: str, *, include_choice_prompts: bool = 
         return None
 
 
-def _match_label(text: str, choices: List[str]) -> Optional[str]:
+def _match_label(text: str, choices: list[str]) -> Optional[str]:
     """Stripped choice text matching ``text`` case-insensitively, ignoring the '(Recommended)'
     suffix the first choice carries by the time it reaches adapters; None if no match."""
     from tools.clarify_tool import strip_recommended
@@ -182,7 +182,7 @@ def _match_label(text: str, choices: List[str]) -> Optional[str]:
     return None
 
 
-def _split_tokens(text: str) -> Optional[List[str]]:
+def _split_tokens(text: str) -> Optional[list[str]]:
     """Comma-separated tokens, or space-separated all-numeric tokens ("1 3"); else None."""
     if "," in text:
         return [t.strip() for t in text.split(",") if t.strip()]
@@ -198,7 +198,7 @@ def _is_int(text: str) -> bool:
         return False
 
 
-def _selection_attempt_tokens(text: str, choices: Optional[List[str]] = None) -> Optional[List[str]]:
+def _selection_attempt_tokens(text: str, choices: Optional[list[str]] = None) -> Optional[list[str]]:
     """Tokens when ``text`` looks like a typed selection (bare int, comma list,
     all-numeric space list); None for free prose so the gateway can release the
     clarify. Comma-list labels may span up to the longest choice's word count."""
@@ -207,7 +207,7 @@ def _selection_attempt_tokens(text: str, choices: Optional[List[str]] = None) ->
         return None
     tokens = _split_tokens(stripped)
     if tokens is None:
-        digits = stripped[1:] if stripped.startswith("-") else stripped
+        digits = stripped.removeprefix("-")
         return [stripped] if digits.isdigit() or _is_int(stripped) else None
     if "," not in stripped or not tokens:
         return tokens or None
