@@ -60,13 +60,8 @@ def handle_command(cli, command, *, display=None):
             raise ValueError('MAINTENANCE_ANSWER_TEXT_REQUIRED')
         consent = text.lower() in ('同意', '确认', '拒绝', '不同意', 'yes', 'agree', 'no', 'reject')
         binding = answer_binding(home, caller, ref=ref, consent=consent)
-        receipt = commit_control(cli, 'typed_clarify_response',
-                                 (ref + ' ' + text) if ref else text, binding=binding)
-        source = committed_source_for_receipt(home, cli.session_id, receipt)
-        if source is None:
-            raise ValueError('MAINTENANCE_ANSWER_COMMIT_FAILED')
-        render('回答已提交，维护运行时将重验并处理。')
-        return source['source_id']
+        return _submit_bound_answer(cli, home, caller, text, binding,
+                                    ref=ref, consent=consent, display=render)
     if operation == 'submit':
         text = ' '.join(args).strip()
         if not text:
@@ -78,6 +73,19 @@ def handle_command(cli, command, *, display=None):
         render('维护来源已持久交接；关闭 CLI 不取消任务。')
         return source['source_id']
     raise ValueError('Usage: /maintenance inbox | status [task] | answer <ref> <text> | result [task] | cancel <task> | submit text')
+
+
+def _submit_bound_answer(cli, home, caller, text, binding, *, ref=None, consent=True, display=None):
+    # Recheck the selected question, never redirect this answer to a replacement.
+    if answer_binding(home, caller, ref=ref, consent=consent) != binding:
+        raise ValueError('MAINTENANCE_INBOX_EXACT_DISPLAYED_QUESTION_REQUIRED')
+    receipt = commit_control(cli, 'typed_clarify_response',
+                             (ref + ' ' + text) if ref else text, binding=binding)
+    source = committed_source_for_receipt(home, cli.session_id, receipt)
+    if source is None:
+        raise ValueError('MAINTENANCE_ANSWER_COMMIT_FAILED')
+    (display or cli._console_print)('回答已提交，维护运行时将重验并处理。')
+    return source['source_id']
 
 
 def notify_pending(cli):
@@ -96,7 +104,11 @@ def consume_bare_consent(cli, raw):
     if not inbox_enabled(get_hermes_home()):
         return False
     try:
-        handle_command(cli, shlex.join(['/maintenance', 'answer', raw]))
+        home, caller = _caller(cli)
+        binding = answer_binding(home, caller, consent=True, allow_missing=True)
+        if binding is None:
+            return False
+        _submit_bound_answer(cli, home, caller, raw.strip(), binding)
     except (ValueError, OSError) as exc:
         cli._console_print(str(exc))
     return True

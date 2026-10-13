@@ -65,7 +65,7 @@ def _request_matches(task, source):
             and all(source.get(key) == task.get(column) for key, column in keys.items()))
 
 
-def read_inbox(home, source_id, *, task_id=None):
+def read_inbox(home, source_id, *, task_id=None, strict_read=False):
     """Same-owner CLI/gateway contract. Reading alone supplies no display evidence."""
     source, owner = caller_owner(home, source_id)
     try:
@@ -109,7 +109,14 @@ def read_inbox(home, source_id, *, task_id=None):
         return visible
     except sqlite3.OperationalError as exc:
         if 'unable to open database' in str(exc):
-            return []
+            if not strict_read:
+                return []
+            # Chat routing may treat a missing journal as empty, never an
+            # existing journal that SQLite could not read.
+            try:
+                (Path(home).resolve() / 'mem0-governance' / 'production.sqlite3').stat()
+            except FileNotFoundError:
+                return []
         raise
 
 
@@ -172,8 +179,8 @@ def verify_display_receipt(home, owner, payload, receipt):
         return False
 
 
-def answer_binding(home, source_id, *, ref=None, consent=False, text=None):
-    """Bare answers select only a unique prompt displayed in this CLI session."""
+def answer_binding(home, source_id, *, ref=None, consent=False, text=None, allow_missing=False):
+    """Select an exact display; only bare CLI routing may opt out when none matches."""
     source, _ = caller_owner(home, source_id)
     if source['authority'] != 'cli-local':
         if ref is None or text is None:
@@ -195,12 +202,14 @@ def answer_binding(home, source_id, *, ref=None, consent=False, text=None):
         if projected is None:
             raise ValueError('MAINTENANCE_INBOX_EXACT_DISPLAYED_QUESTION_REQUIRED')
         return {k: projected['payload'][k] for k in ('task_id', 'item_id', 'proposal_revision')}
-    rows = [r for r in read_inbox(home, source_id) if r['kind'] == 'QUESTION'
+    rows = [r for r in read_inbox(home, source_id, strict_read=allow_missing) if r['kind'] == 'QUESTION'
             and (not consent or r['payload']['kind'] == 'CONFIRM')
             and r['evidence_level'] == 'DISPLAYED' and r['receipt']
             and verify_display_receipt(home, caller_owner(home, source_id)[1], r['payload'], r['receipt'])
             and (r['ref'] == ref if ref is not None else
                  r['receipt'].get('display_session_id') == source['session_id'])]
+    if not rows and allow_missing and ref is None and consent:
+        return None
     if len(rows) != 1:
         raise ValueError('MAINTENANCE_INBOX_EXACT_DISPLAYED_QUESTION_REQUIRED')
     payload = rows[0]['payload']
