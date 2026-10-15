@@ -149,13 +149,11 @@ def adopt_unanswered_turn(history: list[dict[str, Any]], query: Any, agent: Any)
     A dispatcher's re-run of a failed delivery turn resumes the DM its first attempt already persisted
     instead of appending it again. Rows loaded from the store are born durable (``_rows_to_conversation``),
     so handing the tail row back as ``agent._pending_cli_user_message`` makes ``_stage_turn_user_message``
-    reuse it as this turn's user dict and the flush writes no second row. What differs per lane is only HOW
-    the dispatcher knows the DM is unanswered:
-
-    * ``hermes_cli.quiet_single_query.adopt_unanswered_turn`` — the delivery lanes' re-run is a fresh CLI
-      process, told so through ``tools.bot_relay.RESUME_UNANSWERED_TURN_ENV``.
-    * ``gateway.platforms.api_server`` — the peer-DM lane re-runs the turn in-process and calls this
-      directly on the agent it just built for the re-run (#115325).
+    reuse it as this turn's user dict and the flush writes no second row. The one caller is
+    ``gateway.platforms.api_server`` (``resume_unanswered_turn``): the peer-DM lane re-runs the turn
+    in-process and calls this on the agent it just built for the re-run (#115325). The owner-side Bot
+    Chat retry (``gateway.session_bot._maybe_retry``) does not adopt: its failed turn is already closed
+    by the durable failed-turn boundary, which this function declines by design.
 
     The DM is not always the literal tail: a turn that died mid-way persisted its tool scaffolding — assistant
     ``tool_calls`` rows and their ``tool`` results — behind the DM before the failure text was built, and the
@@ -243,15 +241,6 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
     copy_identity_fields(msg, row)
     if isinstance(msg.get(DB_ROW_SNAPSHOT), str):
         row[DB_ROW_SNAPSHOT] = msg[DB_ROW_SNAPSHOT]
-    if is_current_turn_user and role == "user":
-        from hermes_inbound_evidence import current_row_admission
-        admission = current_row_admission()
-        if admission is not None:
-            row["_authenticated_inbound"] = admission
-        from hermes_maintenance_source import current_admitted_source, with_display
-        source = msg.get("_maintenance_source") or current_admitted_source()
-        if source is not None:
-            row["_maintenance_source"] = with_display(source, row.get("content"))
     return row
 
 
@@ -403,8 +392,7 @@ def _db_flush_failed(agent, e: Exception, batch_rows: list[dict[str, Any]], adop
         try:
             # The CAS digest / adopted row are local repair bookkeeping, not transcript payload.
             divert_session_transcript_jsonl(getattr(agent, "session_id", "") or "",
-                                            [{k: v for k, v in r.items()
-                                              if k not in REPAIR_BOOKKEEPING_FIELDS and k not in ("_authenticated_inbound", "_maintenance_source")}
+                                            [{k: v for k, v in r.items() if k not in REPAIR_BOOKKEEPING_FIELDS}
                                              for r in batch_rows])
         except Exception:
             logger.warning("JSONL divert failed after state.db %s for %s",

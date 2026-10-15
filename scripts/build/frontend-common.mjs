@@ -76,10 +76,10 @@ export function productOutput(source, out, inputs) {
 
 // Windows refuses to move a tree while anything holds a handle inside it, and
 // an antivirus scanner opens every freshly written exe. Node reports that as
-// EPERM/EACCES/EBUSY; it clears in moments, so ride it out (~3s) rather than
+// EPERM/EACCES/EBUSY; allow the fork's 20s Windows hold budget rather than
 // throw away a build that took minutes. Other codes never clear by waiting.
 const heldCodes = new Set(['EPERM', 'EACCES', 'EBUSY'])
-const heldRetryDelays = [100, 200, 400, 800, 1600]
+const heldRetryDelays = process.platform === 'win32' ? Array(200).fill(100) : [100, 200, 400, 800, 1600]
 
 export function retryHeld(operation) {
   for (const delay of [...heldRetryDelays, undefined]) {
@@ -93,35 +93,34 @@ export function retryHeld(operation) {
 }
 
 // Never delete the last successful product before a compiler succeeds. The
-// staging and backup directories are siblings so publication stays on one FS.
-function renameProduct(from, to) {
-  const wait = new Int32Array(new SharedArrayBuffer(4))
-  for (let attempt = 0; ; attempt++) {
-    try {
-      renameSync(from, to)
-      return
-    } catch (error) {
-      // Windows scanners may briefly hold freshly written build artifacts.
-      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt >= 200) throw error
-      Atomics.wait(wait, 0, 0, 100)
-    }
-  }
-}
-
+// backup lives beside out, outside withProduct's scratch tree, so a failed
+// rollback leaves the previous product somewhere a person can recover it.
 export function publishDirectory(staged, out, { source } = {}) {
   // The destination may have been occupied while the compiler was running.
   requireOwnedOutput(out, source)
   writeFileSync(path.join(staged, productMarker), productOwner)
-  const backup = `${staged}.previous`
-  const previous = existsSync(out)
-  if (previous) renameProduct(out, backup)
+  if (!existsSync(out)) return retryHeld(() => renameSync(staged, out))
+  const backupRoot = mkdtempSync(path.join(path.dirname(out), `.${path.basename(out)}-previous-`))
+  const backup = path.join(backupRoot, 'product')
   try {
-    renameProduct(staged, out)
+    retryHeld(() => renameSync(out, backup))
   } catch (error) {
-    if (previous) renameProduct(backup, out)
+    rmSync(backupRoot, { recursive: true, force: true })
     throw error
   }
-  if (previous) rmSync(backup, { recursive: true, force: true })
+  try {
+    retryHeld(() => renameSync(staged, out))
+  } catch (error) {
+    try {
+      retryHeld(() => renameSync(backup, out))
+    } catch (rollbackError) {
+      error.message += `; rollback failed (${rollbackError.message}); previous product kept at ${backup}`
+      throw error
+    }
+    rmSync(backupRoot, { recursive: true, force: true })
+    throw error
+  }
+  rmSync(backupRoot, { recursive: true, force: true })
 }
 
 export async function withProduct(out, compile, { source } = {}) {

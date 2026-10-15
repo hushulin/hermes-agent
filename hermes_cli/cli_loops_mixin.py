@@ -64,6 +64,15 @@ def _print_decision_message(decision: dict) -> bool:
     return bool(msg)
 
 
+def _goal_blocks_loop_tick(mgr) -> bool:
+    """``loops.goal_blocks_loop_tick`` for this loop's session: asked of the gateway when the manager
+    is the gateway's (it reads the goal row and its barrier where they live)."""
+    if hasattr(mgr, "goal_blocks_tick"):
+        return mgr.goal_blocks_tick()
+    from hermes_cli.loops import goal_blocks_loop_tick
+    return goal_blocks_loop_tick(mgr.session_id)
+
+
 class CLILoopsMixin:
     """Simple slash-command wrappers plus goal/heartbeat/loop manager hooks for the interactive CLI"""
 
@@ -211,18 +220,11 @@ class CLILoopsMixin:
                 provider=getattr(self, "provider", None), model=getattr(self, "model", None), turns=turns)
 
     def _cmd_retry(self, cmd_original: str):
-        from hermes_cli.maintenance_input import AuthoredInput, latest_retry_source_info
-        reuse, blocked = latest_retry_source_info(self)
-        if blocked:
-            from cli import _cprint
-            _cprint(f"  {t('gateway.retry.unsafe', error='latest source belongs to another author')}")
-            return
         retry_msg = self.retry_last()
         if retry_msg:
             self._record_model_friction("retry")
         if retry_msg and hasattr(self, '_pending_input'):
-            raw = reuse.raw if reuse is not None else retry_msg
-            self._pending_input.put(AuthoredInput(retry_msg, raw=raw, source=reuse))
+            self._pending_input.put(retry_msg)  # process_loop sends it to the agent
 
     def _cmd_undo(self, cmd_original: str):
         # "/undo" → 1, "/undo 3" → 3.
@@ -349,10 +351,8 @@ class CLILoopsMixin:
 
     def _queue_enqueue(self, text: str) -> None:
         from cli import _cprint
-        from hermes_cli.maintenance_input import AuthoredInput, commit_control, remember_steer
         payload = self._expand_paste_references(text)
-        control = commit_control(self, "slash_queue", text, extraction=payload)
-        self._pending_input.put(AuthoredInput(payload, raw=text, source=control))
+        self._pending_input.put(payload)
         key = "cli.queue.queued_next_turn" if self._agent_running else "cli.queue.queued"
         _cprint(f"  {t(key, preview=_preview(payload))}")
 
@@ -397,26 +397,15 @@ class CLILoopsMixin:
         if idx is None:
             _cprint(f"  {t('cli.queue.usage_edit')}")
             return
-        raw_prompt = bits[1].strip()
-        new_text = self._expand_paste_references(raw_prompt)
-        from hermes_cli.maintenance_input import AuthoredInput, commit_control, revise_control
-
-        def _control_for(item):
-            base = getattr(item, "maintenance_source", None)
-            return (revise_control(self, base, "queue_edit", raw_prompt, extraction=new_text)
-                    if base is not None else
-                    commit_control(self, "queue_edit", raw_prompt, extraction=new_text))
+        new_prompt = bits[1]
+        new_text = self._expand_paste_references(new_prompt.strip())
 
         def _edit(items: list) -> list:
             if 1 <= idx <= len(items):
                 # A voice-queued item keeps its sentinel so the concise voice-response
                 # prefix still applies (#65827).
                 voice = isinstance(items[idx - 1], _VoiceInputMessage)
-                if voice:
-                    items[idx - 1] = _VoiceInputMessage(new_text)
-                else:
-                    items[idx - 1] = AuthoredInput(
-                        new_text, raw=raw_prompt, source=_control_for(items[idx - 1]))
+                items[idx - 1] = _VoiceInputMessage(new_text) if voice else new_text
             return items
 
         before, after = self._mutate_pending_input(_edit)
@@ -476,7 +465,6 @@ class CLILoopsMixin:
         # agent runs, push into its pending_steer slot (drained by _execute_tool_calls_*
         # into the next tool result); otherwise fall back to /queue semantics.
         from cli import _cprint, _slash_args
-        from hermes_cli.maintenance_input import AuthoredInput, commit_control, remember_steer
         payload = _slash_args(cmd_original)
         if not payload:
             _cprint(f"  {t('cli.steer.usage')}")
@@ -487,15 +475,11 @@ class CLILoopsMixin:
                 _cprint(f"  {t('cli.steer.failed', error=exc)}")
             else:
                 if accepted:
-                    control = commit_control(self, "slash_steer", payload)
-                    if control is not None:
-                        remember_steer(self, payload, control)
                     _cprint(f"  {t('cli.steer.queued', preview=_preview(payload))}")
                 else:
                     _cprint(f"  {t('cli.steer.rejected_empty')}")
         else:
-            control = commit_control(self, "slash_steer", payload)
-            self._pending_input.put(AuthoredInput(payload, raw=payload, source=control))
+            self._pending_input.put(payload)
             _cprint(f"  {t('cli.steer.no_agent_queued', preview=_preview(payload))}")
 
     # ────────────────────────────────────────────────────────────────
@@ -523,35 +507,64 @@ class CLILoopsMixin:
         setattr(self, attr, mgr)
         return mgr
 
+    def _automation_connection(self):
+        """``(gateway, connection)``: on a gateway session store the managers are the gateway's
+        (``hermes_cli.gateway_automation``), and none exists until the gateway session is open, so this
+        process never opens state.db read-write nor calls the goal judge. Off the gateway (tests, the
+        TUI slash worker's shadow CLI) main's in-process managers apply."""
+        from hermes_cli.gateway_session_store import GatewaySessionStore
+        store = getattr(self, "_session_db", None)
+        if not isinstance(store, GatewaySessionStore):
+            return False, None
+        return True, store.connection if getattr(self, "_gateway_session_open", False) else None
+
+    def _automation_manager(self, attr, label, local, remote):
+        gateway, connection = self._automation_connection()
+        if gateway and connection is None:
+            return None
+        return self._session_bound_manager(
+            attr, label, (lambda: lambda sid: remote(sid, connection)) if gateway else local)
+
     def _get_goal_manager(self):
         """GoalManager bound to the current session_id (see ``_session_bound_manager``)."""
+        def max_turns():
+            from hermes_cli.config import load_config
+            try:
+                goals_cfg = (load_config() or {}).get("goals") or {}
+                return int(goals_cfg.get("max_turns", 20) or 20)
+            except Exception:  # health: allow BLE001 -- main's fallback: an unreadable goals config is the 20-turn default
+                return 20
+
         def load():
             from hermes_cli.goals import GoalManager
-            from hermes_cli.config import load_config
+            return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns())
 
-            def make(sid):
-                try:
-                    goals_cfg = (load_config() or {}).get("goals") or {}
-                    max_turns = int(goals_cfg.get("max_turns", 20) or 20)
-                except Exception:
-                    max_turns = 20
-                return GoalManager(session_id=sid, default_max_turns=max_turns)
-            return make
-        return self._session_bound_manager("_goal_manager", "goal manager", load)
+        def remote(sid, connection):
+            from hermes_cli.gateway_automation import GatewayGoalManager
+            return GatewayGoalManager(sid, connection)
+        return self._automation_manager("_goal_manager", "goal manager", load, remote)
 
     def _get_heartbeat_manager(self):
         """HeartbeatManager bound to the current session_id (see ``_session_bound_manager``)."""
         def load():
             from hermes_cli.heartbeat import HeartbeatManager
             return lambda sid: HeartbeatManager(session_id=sid)
-        return self._session_bound_manager("_heartbeat_manager", "heartbeat manager", load)
+
+        def remote(sid, connection):
+            from hermes_cli.gateway_automation import GatewayHeartbeatManager
+            return GatewayHeartbeatManager(sid, connection)
+        return self._automation_manager("_heartbeat_manager", "heartbeat manager", load, remote)
 
     def _get_loop_manager(self):
         """LoopManager bound to the current session_id (see ``_session_bound_manager``)."""
         def load():
             from hermes_cli.loops import LoopManager
             return lambda sid: LoopManager(session_id=sid)
-        return self._session_bound_manager("_loop_manager", "loop manager", load)
+
+        def remote(sid, connection):
+            from hermes_cli.gateway_automation import GatewayLoopManager
+            return GatewayLoopManager(sid, connection)
+        return self._automation_manager("_loop_manager", "loop manager", load, remote)
 
     def _start_heartbeat_watchdog(self):
         """Start the idle-poll daemon that injects a due heartbeat prompt into
@@ -639,8 +652,7 @@ class CLILoopsMixin:
         except Exception:
             return
         try:
-            from hermes_cli.loops import goal_blocks_loop_tick
-            if goal_blocks_loop_tick(mgr.session_id):
+            if _goal_blocks_loop_tick(mgr):
                 return
         except Exception:
             pass

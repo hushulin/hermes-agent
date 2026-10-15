@@ -441,36 +441,20 @@ def _mark_tui_input_modes_active() -> None:
 
 
 def _prepare_deferred_agent_startup() -> None:
-    """Run Termux-deferred agent discovery before the first real agent turn."""
+    """Run Termux-deferred plugin discovery before the first real agent turn. MCP servers, shell
+    hooks and outbound webhooks belong to the gateway that runs the turn (session policy)."""
     global _deferred_agent_startup_done
     if _deferred_agent_startup_done:
         return
     if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
         return
     _deferred_agent_startup_done = True
-    _accept_hooks = os.environ.get("HERMES_ACCEPT_HOOKS", "").lower() in {"1", "true", "yes", "on"}
     try:
         from hermes_cli.plugins import discover_plugins
 
         discover_plugins()
     except Exception:
         logger.warning("plugin discovery failed at deferred CLI startup", exc_info=True)
-    try:
-        from hermes_cli.mcp_startup import start_background_mcp_discovery
-
-        start_background_mcp_discovery(logger=logger, thread_name="termux-cli-mcp-discovery")
-    except Exception:
-        logger.debug("MCP tool discovery failed at deferred CLI startup", exc_info=True)
-    try:
-        from agent.shell_hooks import register_from_config
-        from agent.outbound_webhooks import register_from_config as register_outbound_webhooks
-        from hermes_cli.config import load_config
-
-        _hooks_cfg = load_config()
-        register_from_config(_hooks_cfg, accept_hooks=_accept_hooks)
-        register_outbound_webhooks(_hooks_cfg)
-    except Exception:
-        logger.debug("shell-hook registration failed at deferred CLI startup", exc_info=True)
 
 
 _signal_watchdog_armed = False
@@ -1207,6 +1191,12 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         entry = self._slash_handler(canonical)
         if entry is None:
             return self._process_unregistered_slash(cmd_original, cmd_lower)
+        from hermes_cli.gateway_setting_commands import run as run_gateway_setting
+        if run_gateway_setting(self, canonical, cmd_original):
+            return True  # a per-session setting the gateway's handler applied
+        from hermes_cli.gateway_cli_commands import run as run_gateway_command
+        if run_gateway_command(self, canonical, cmd_original):
+            return True  # state the gateway session owns (checkpoints, .env, handoff)
         method_name, pass_arg = entry
         handler = getattr(self, method_name)
         result = handler(cmd_original) if pass_arg else handler()
@@ -1225,11 +1215,9 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         if bare in _get_plugin_cmd_handler_names():
             self._run_plugin_slash_command(base_cmd, user_args)
         elif base_cmd in skill_bundles:
-            self._run_skill_bundle_command(
-                base_cmd, skill_bundles[base_cmd], user_args, raw_command=cmd_original)
+            self._run_skill_bundle_command(base_cmd, skill_bundles[base_cmd], user_args)
         elif base_cmd in skill_commands:
-            self._run_skill_slash_command(
-                base_cmd, skill_commands[base_cmd], user_args, raw_command=cmd_original)
+            self._run_skill_slash_command(base_cmd, skill_commands[base_cmd], user_args)
         else:
             return self._expand_slash_prefix(cmd_original, cmd_lower, skill_commands, skill_bundles)
         return True
@@ -1289,13 +1277,11 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         except Exception as e:
             _cprint(f"\033[1;31m{_t('cli.plugin.command_error', error=str(e))}{_RST}")
 
-    def _queue_skill_message(self, msg, *, raw: str | None = None) -> None:
+    def _queue_skill_message(self, msg) -> None:
         if hasattr(self, '_pending_input'):
-            from hermes_cli.maintenance_input import AuthoredInput
-            self._pending_input.put(AuthoredInput(msg, raw=raw) if raw else msg)
+            self._pending_input.put(msg)
 
-    def _run_skill_bundle_command(self, base_cmd: str, bundle_info: dict, user_instruction: str,
-                                  *, raw_command: str | None = None) -> None:
+    def _run_skill_bundle_command(self, base_cmd: str, bundle_info: dict, user_instruction: str) -> None:
         """``/<bundle>`` loads several skills at once (bundles win over same-named skills)."""
         bundle_result = build_bundle_invocation_message(base_cmd, user_instruction, task_id=self.session_id)
         if not bundle_result:
@@ -1303,17 +1289,15 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             return
         msg, loaded_names, missing = bundle_result
         self._queue_loaded_skills(
-            msg, _t("cli.skills.loading_bundle", name=bundle_info['name'], count=str(len(loaded_names))), missing,
-            raw=raw_command or f"{base_cmd} {user_instruction}".strip())
+            msg, _t("cli.skills.loading_bundle", name=bundle_info['name'], count=str(len(loaded_names))), missing)
 
-    def _queue_loaded_skills(self, msg, label: str, missing, *, raw: str | None = None) -> None:
+    def _queue_loaded_skills(self, msg, label: str, missing) -> None:
         print(f"\n⚡ {label}")
         if missing:
             ChatConsole().print(f"[yellow]{_t('cli.skills.skipped_missing', names=', '.join(missing))}[/]")
-        self._queue_skill_message(msg, raw=raw)
+        self._queue_skill_message(msg)
 
-    def _run_skill_slash_command(self, base_cmd: str, skill_info: dict, rest: str,
-                                 *, raw_command: str | None = None) -> None:
+    def _run_skill_slash_command(self, base_cmd: str, skill_info: dict, rest: str) -> None:
         """``/<skill> ...``; stacked ``/skill-a /skill-b do XYZ`` loads every leading skill (up to 5)."""
         from agent.skill_commands import build_stacked_skill_invocation_message, split_stacked_skill_commands
 
@@ -1330,14 +1314,12 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             msg, loaded_names, missing = stacked_result
             self._queue_loaded_skills(
                 msg, _t("cli.skills.loading_stacked", count=str(len(loaded_names)), names=', '.join(loaded_names)),
-                missing, raw=raw_command or " ".join([base_cmd, *extra_keys, user_instruction]).strip(),
+                missing,
             )
             return
         msg = build_skill_invocation_message(base_cmd, rest, task_id=self.session_id)
         if msg:
-            self._queue_loaded_skills(
-                msg, _t("cli.skills.loading_skill", name=skill_info['name']), None,
-                raw=raw_command or f"{base_cmd} {rest}".strip())
+            self._queue_loaded_skills(msg, _t("cli.skills.loading_skill", name=skill_info['name']), None)
         else:
             ChatConsole().print(f"[bold red]{_t('cli.skills.skill_load_failed', command=base_cmd)}[/]")
 

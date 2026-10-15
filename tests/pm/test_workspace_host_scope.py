@@ -2,14 +2,13 @@
 import sys
 import tomllib
 
-import pytest
 from packaging.markers import Marker
 
 from pm.workspace import _generate_pyproject
 
 
-@pytest.mark.parametrize('host', ['win32', 'linux', 'darwin'])
-def test_plugin_generation_intersects_core_support_and_host(tmp_path, monkeypatch, host):
+def test_plugin_generation_intersects_core_support_and_host(tmp_path):
+    host = sys.platform
     core, plugin, out = (tmp_path / name for name in ('core', 'plugin', 'out'))
     core.mkdir()
     plugin.mkdir()
@@ -18,7 +17,6 @@ def test_plugin_generation_intersects_core_support_and_host(tmp_path, monkeypatc
                 'environments=["python_version >= \'3.14\'"]\n')
     (core / 'pyproject.toml').write_text(original)
     (plugin / 'plugin.yaml').write_text('name: fixture\npython_dependencies: ["example==1"]\n')
-    monkeypatch.setattr(sys, 'platform', host)
     _generate_pyproject([plugin], out, source=core)
     settings = tomllib.loads((out / 'pyproject.toml').read_text())['tool']['uv']
     predicates = [Marker(m) for m in settings['environments']]

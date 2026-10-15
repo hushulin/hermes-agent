@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
+from agent import conversation_compression_tools
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor_summary import _accepts_keyword_argument
 from agent.context_engine import automatic_compaction_status_message, sanitize_memory_context
@@ -161,20 +162,6 @@ def is_compaction_progress_status(text: str | None) -> bool:
     if "compaction complete" in lowered or "compression is currently blocked" in lowered:
         return False
     return "compact" in lowered or "compress" in lowered or "context reduced to" in lowered
-
-
-def _refresh_agent_tool_definitions(agent) -> bool:
-    """Rebuild agent.tools at the compaction commit boundary (the only moment config reaches a forever-session's
-    frozen tool schemas; the prompt cache is already invalid). Returns True when tools were added."""
-    if getattr(agent, "_skip_mcp_refresh", False):
-        # Same instance-local surface opt-out the between-turns hook honours: a restricted
-        # agent's schemas are never registered, so a registry rebuild would empty them.
-        return False
-    from tools.mcp_tool_agent import refresh_agent_mcp_tools
-    added = refresh_agent_mcp_tools(agent, content_aware=True)
-    if added:
-        logger.info("Compaction tool refresh added tools: %s", sorted(added))
-    return bool(added)
 
 
 _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
@@ -3144,7 +3131,7 @@ def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str) -> str:
         # surface: its builder output drops the skills index, external provider blocks and tool guidance,
         # and the commit below would persist that over the live session's snapshot (restored verbatim by
         # the next fresh agent). Keep the seeded bytes; the live agent's own compaction propagates updates.
-        # Returning here also deliberately skips _refresh_agent_tool_definitions: its MCP refresh persists
+        # Returning here also deliberately skips the tool refresh: its MCP refresh persists
         # the agent's tool names, which would overwrite the session's saved tools[] with the memory-only set.
         if agent._cached_system_prompt:
             from agent.system_prompt import reconstruct_static_prefix
@@ -3160,7 +3147,7 @@ def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str) -> str:
     # the refresh is free; when nothing changed the snapshot is byte-equal and we keep the existing list
     # object (identity matters to provider-side tool-block caching on some backends).
     try:
-        _refresh_agent_tool_definitions(agent)
+        conversation_compression_tools.refresh_agent_tool_definitions(agent)
     except Exception:
         logger.warning(
             "compaction tool-definition refresh failed; keeping the session's existing tool snapshot", exc_info=True
@@ -3275,18 +3262,9 @@ def _carry_session_state_to_child(agent: Any, old_session_id: str, old_title: An
     is carried unchanged (renumbering per rotation made one session look like many); its provenance is read BEFORE the
     transfer clears the ancestor's row, then restored so an inherited auto-title stays upgradeable.
     """
-    with _swallow('Could not migrate goal on compression: %s'):
-        # Carry a persistent /goal onto the continuation session. Compression mints a fresh child id;
-        # load_goal does a flat per-session lookup with no parent walk, so without this an active goal
-        # silently dies at the boundary (#33618).
-        from hermes_cli.goals import migrate_goal_to_session
-        migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
-    with _swallow('Could not migrate heartbeat on compression: %s'):
-        from hermes_cli.heartbeat import migrate_heartbeat_to_session
-        migrate_heartbeat_to_session(old_session_id, agent.session_id)
-    with _swallow('Could not migrate loop on compression: %s'):
-        from hermes_cli.loops import migrate_loop_to_session
-        migrate_loop_to_session(old_session_id, agent.session_id, reason="compression")
+    # /goal, /heartbeat, /loop: carried locally, or atomically by the owner on a RuntimeSessionStore.
+    from agent.compression_automation import carry_compression_automation
+    carry_compression_automation(agent, old_session_id)
     with _swallow('Could not carry rejected thinking on compression: %s'):
         from agent.anthropic_thinking_replay import carry_rejected_thinking_to_session
         carry_rejected_thinking_to_session(agent, old_session_id)
