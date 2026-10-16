@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
+from agent import conversation_compression_tools
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor_summary import _accepts_keyword_argument
 from agent.context_engine import automatic_compaction_status_message, sanitize_memory_context
@@ -161,16 +162,6 @@ def is_compaction_progress_status(text: str | None) -> bool:
     if "compaction complete" in lowered or "compression is currently blocked" in lowered:
         return False
     return "compact" in lowered or "compress" in lowered or "context reduced to" in lowered
-
-
-def _refresh_agent_tool_definitions(agent) -> bool:
-    """Rebuild agent.tools at the compaction commit boundary (the only moment config reaches a forever-session's
-    frozen tool schemas; the prompt cache is already invalid). Returns True when tools were added."""
-    from tools.mcp_tool_agent import refresh_agent_mcp_tools
-    added = refresh_agent_mcp_tools(agent, content_aware=True)
-    if added:
-        logger.info("Compaction tool refresh added tools: %s", sorted(added))
-    return bool(added)
 
 
 _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
@@ -3140,7 +3131,7 @@ def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str) -> str:
         # surface: its builder output drops the skills index, external provider blocks and tool guidance,
         # and the commit below would persist that over the live session's snapshot (restored verbatim by
         # the next fresh agent). Keep the seeded bytes; the live agent's own compaction propagates updates.
-        # Returning here also deliberately skips _refresh_agent_tool_definitions: its MCP refresh persists
+        # Returning here also deliberately skips the tool refresh: its MCP refresh persists
         # the agent's tool names, which would overwrite the session's saved tools[] with the memory-only set.
         if agent._cached_system_prompt:
             from agent.system_prompt import reconstruct_static_prefix
@@ -3156,7 +3147,7 @@ def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str) -> str:
     # the refresh is free; when nothing changed the snapshot is byte-equal and we keep the existing list
     # object (identity matters to provider-side tool-block caching on some backends).
     try:
-        _refresh_agent_tool_definitions(agent)
+        conversation_compression_tools.refresh_agent_tool_definitions(agent)
     except Exception:
         logger.warning(
             "compaction tool-definition refresh failed; keeping the session's existing tool snapshot", exc_info=True

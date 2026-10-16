@@ -76,10 +76,10 @@ export function productOutput(source, out, inputs) {
 
 // Windows refuses to move a tree while anything holds a handle inside it, and
 // an antivirus scanner opens every freshly written exe. Node reports that as
-// EPERM/EACCES/EBUSY; it clears in moments, so ride it out (~3s) rather than
+// EPERM/EACCES/EBUSY; allow the fork's 20s Windows hold budget rather than
 // throw away a build that took minutes. Other codes never clear by waiting.
 const heldCodes = new Set(['EPERM', 'EACCES', 'EBUSY'])
-const heldRetryDelays = [100, 200, 400, 800, 1600]
+const heldRetryDelays = process.platform === 'win32' ? Array(200).fill(100) : [100, 200, 400, 800, 1600]
 
 export function retryHeld(operation) {
   for (const delay of [...heldRetryDelays, undefined]) {

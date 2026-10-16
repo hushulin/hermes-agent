@@ -165,6 +165,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<prompt>", busy_policy="reject", busy_handler="moa"),
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
                args_hint="[text | remove N | clear]", busy_policy="dispatch"),
+    CommandDef("maintenance", "Retired legacy maintenance command (no operation)", "Info",
+               busy_policy="dispatch", desktop="hidden"),
     CommandDef("status", "Show session, model, token, and context info", "Session",
                busy_policy="dispatch"),
     CommandDef("egress", "Show Docker egress proxy status", "Session",

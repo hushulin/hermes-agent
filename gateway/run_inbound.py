@@ -71,6 +71,10 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
 class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
+    async def _handle_maintenance_command(self, event):
+        from hermes_cli.maintenance_host import RETIRED_MESSAGE
+        return RETIRED_MESSAGE
+
     async def _hm_offer_pairing_code(self, source: SessionSource) -> None:
         """DM an unauthorized sender a pairing code (rate-limited; groups never reach here)."""
         platform_name = source.platform.value if source.platform else "unknown"

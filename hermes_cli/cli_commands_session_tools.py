@@ -93,6 +93,11 @@ class CLICommandsSessionToolsMixin:
     """``/stop``, ``/agents``, ``/journey``, ``/paste``, ``/copy``, ``/image``, ``/tools``,
     ``/profile`` handlers (moved from ``CLICommandsMixin``)."""
 
+    def _handle_maintenance_command(self, command):
+        from hermes_cli.maintenance_host import handle_command
+        handle_command(self, command)
+        return True
+
 
     # ---- /stop, /agents -------------------------------------------------------------------
     def _handle_stop_command(self):
